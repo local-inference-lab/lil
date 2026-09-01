@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the lil project
+
+schema_version: 1
+kind: local
+name: local-test
+host: 0.0.0.0
+port: 8000
+gpu_memory_utilization: 0.95
+device_memory_bytes: 102641958912
+repo_root: /home/luke/projects/vllm-hh-rebase
+python: .venv/bin/python
+b12x_root: /home/luke/projects/b12x
+cuda_home: /opt/cuda
+cute_dsl_arch: sm_120a
+device_pools:
+  - [8, 9, 10, 11]
+  - [0, 1, 2, 3, 4, 5, 6, 7]
+  - [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]

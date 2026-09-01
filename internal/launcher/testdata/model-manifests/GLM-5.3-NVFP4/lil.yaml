@@ -1,0 +1,12 @@
+schema_version: 1
+kind: model
+extends: glm-5.3
+description: GLM-5.3 with NVFP4 routed experts and an unquantized BF16 MTP expert layer
+weight_bytes: 464823066832
+launch:
+  local:
+    default_tp_size: 8
+  spark_rdma:
+    default_tp_size: all
+quantization: null
+mtp_moe_quantization: bf16

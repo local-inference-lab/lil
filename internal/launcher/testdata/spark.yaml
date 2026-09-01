@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the lil project
+
+schema_version: 1
+kind: spark_rdma
+name: spark-test
+host: 0.0.0.0
+port: 8000
+gpu_memory_utilization: 0.95
+device_memory_bytes: 115964116992
+repo_root: /home/luke/projects/vllm-hh-rebase
+python: .venv/bin/python
+b12x_root: /home/luke/projects/b12x
+runtime_repo_root: /home/luke/projects/vllm
+runtime_python: /home/luke/projects/vllm/.venv/bin/python
+vllm_bin: /home/luke/projects/vllm/.venv/bin/vllm
+runtime_b12x_root: /home/luke/projects/b12x
+nodes:
+  - ssh_host: tachyon
+    address: 10.200.0.1
+    ethernet_interface: enp1s0f1np1
+    rdma_interfaces: [rocep1s0f1, roceP2p1s0f1]
+  - ssh_host: luxon
+    address: 10.200.0.2
+    ethernet_interface: enp1s0f0np0
+    rdma_interfaces: [rocep1s0f0, roceP2p1s0f0]
+master_port: 29638
+image: vllm-node-eugr-20260712:latest
+container_name_prefix: vllm-fleet
+container_memory_gb: 108
+container_memory_swap_gb: 112
+container_shm_gb: 64
+container_pids_limit: 4096
+container_nofile_limit: 1048576
+cache_mounts:
+  - source: /home/luke/.cache/huggingface
+    target: /root/.cache/huggingface
+cuda_home: /usr/local/cuda
+cute_dsl_arch: sm_121a
+nccl_debug: INFO
+nccl_ib_gid_index: 3
+nccl_ib_merge_nics: true
+device_id: 0

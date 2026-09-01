@@ -1,0 +1,34 @@
+schema_version: 1
+kind: model
+extends: qwen-3.8-flash-next
+description: Qwen3.8 Flash Next with NVFP4 routed experts and MTP, plus MXFP8 attention and shared experts
+weight_bytes: 105839538520
+launch:
+  local:
+    default_tp_size: 2
+    defaults:
+      environment:
+        VLLM_PLE_CPU_OFFLOAD: "0"
+    tp:
+      1:
+        capacity:
+          max_num_batched_tokens: 2048
+        environment:
+          VLLM_PLE_CPU_OFFLOAD: "1"
+          INSTANTTENSOR_BUFFER_SIZE: "1342177280"
+          INSTANTTENSOR_CONCURRENCY: "1"
+          INSTANTTENSOR_IO_DEPTH: "3"
+  spark_rdma:
+    default_tp_size: all
+    defaults:
+      capacity:
+        max_num_batched_tokens: 2048
+      compilation_config:
+        pass_config:
+          fuse_act_quant: true
+      environment:
+        VLLM_PLE_CPU_OFFLOAD: "0"
+    tp:
+      1:
+        environment:
+          VLLM_PLE_CPU_OFFLOAD: "1"
