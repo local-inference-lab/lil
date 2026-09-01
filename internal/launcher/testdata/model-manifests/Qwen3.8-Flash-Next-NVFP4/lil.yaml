@@ -1,8 +1,33 @@
 schema_version: 1
 kind: model
-extends: qwen-3.8-flash-next
+extends:
+  - common
+  - full-graph
 description: Qwen3.8 Flash Next with NVFP4 routed experts and MTP, plus MXFP8 attention and shared experts
 weight_bytes: 105839538520
+served_model_name: Qwen3.8-Flash-Next
+expected_architectures:
+  - Qwen3_8FlashNextForConditionalGeneration
+  - Qwen4ExpForConditionalGeneration
+attention_heads: 24
+quantization: modelopt_mixed
+block_size: 16
+attention_backend: null
+reasoning_parser: qwen3
+tool_call_parser: qwen3_xml
+mamba_cache_mode: align
+async_scheduling: true
+disable_flashinfer_autotune: true
+gdn_decode_kernel: b12x
+model_loader_extra_config:
+  instanttensor_copy: false
+mm_encoder_tp_mode: data
+mm_processor_cache_gb: 0
+limit_mm_per_prompt:
+  image: 1
+default_speculator: mtp
+mtp_tokens: 3
+mtp_moe_quantization: nvfp4
 launch:
   local:
     default_tp_size: 2
