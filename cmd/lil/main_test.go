@@ -44,8 +44,9 @@ func TestListUsesReadableMultilineCards(t *testing.T) {
 	}
 	output := ansi.Strip(renderList(profiles))
 	for _, want := range []string{
-		"Models  3\n\n",
+		"Models  5\n\n",
 		"GLM-5.3-NVFP4",
+		"GLM-5.3-NVFP4-Spark",
 		"GLM-5.3 with NVFP4 routed experts",
 		"defaults  ·  local TP 8  ·  Spark/RDMA TP all",
 		"Topologies  2\n\n",

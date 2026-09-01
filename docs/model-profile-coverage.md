@@ -13,6 +13,10 @@ embeds only the inheritance bases that define common launcher and family
 contracts. Each repository manifest should therefore contain only facts that
 differ from its family base:
 
+An embedded base must describe a semantic contract shared by multiple model
+repositories. A checkpoint name, model version, or one-repository convenience
+alias belongs in that repository's `lil.yaml`, not in the executable.
+
 - semantic family in `extends`;
 - checkpoint description and exact indexed `weight_bytes`;
 - architecture or backend overrides that differ from the family;

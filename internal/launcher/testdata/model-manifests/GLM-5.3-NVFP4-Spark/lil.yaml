@@ -3,8 +3,8 @@ kind: model
 extends:
   - glm
   - full-graph
-description: GLM-5.3 with NVFP4 routed experts and an unquantized BF16 MTP expert layer
-weight_bytes: 464823066832
+description: GLM-5.3 with NVFP4 routed experts, MXFP8 projections, and an NVFP4 MTP expert layer
+weight_bytes: 435548900560
 served_model_name: GLM-5.3
 expected_architectures:
   - GlmMoeDsaForCausalLM
@@ -24,5 +24,5 @@ launch:
     default_tp_size: 8
   spark_rdma:
     default_tp_size: all
-quantization: null
-mtp_moe_quantization: bf16
+quantization: modelopt_mixed
+mtp_moe_quantization: nvfp4

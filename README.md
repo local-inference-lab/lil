@@ -158,14 +158,31 @@ discovery is temporarily unavailable. Launch commands do not use that fallback.
 
 Every launchable repository in `local-inference-lab` owns one `lil.yaml` at its
 root. Identity is derived from the repository; manifests do not repeat a model
-path or contain revisions. A typical serving manifest is deliberately small:
+path or contain revisions. Each serving manifest explicitly owns its
+checkpoint- and version-specific contract:
 
 ```yaml
 schema_version: 1
 kind: model
-extends: glm-5.3
+extends:
+  - glm
+  - full-graph
 description: GLM-5.3 with NVFP4 routed experts and a BF16 MTP expert layer
 weight_bytes: 464823066832
+served_model_name: GLM-5.3
+expected_architectures:
+  - GlmMoeDsaForCausalLM
+trust_remote_code: true
+async_scheduling: true
+generation_config: vllm
+hf_overrides: {}
+long_prefill_token_threshold: 2048
+default_speculator: mtp
+mtp_tokens: 3
+mtp_attention_backend: B12X
+mtp_model: target
+mtp_draft_sample_method: probabilistic
+cuda_device_max_connections: 32
 launch:
   local:
     default_tp_size: 8
@@ -175,11 +192,12 @@ quantization: null
 mtp_moe_quantization: bf16
 ```
 
-The embedded `_bases.yaml` holds cross-model and family policy such as parsers,
-load format, multimodal flags, speculative defaults, and kernel selection.
-Remote manifests extend those semantic bases and contain only checkpoint facts
-or genuine per-model differences. Mappings merge recursively; scalars and
-lists replace inherited values. Unknown fields, duplicate definitions, missing
+The embedded `_bases.yaml` holds only cross-model policy and broad family
+contracts shared by multiple repositories. It does not contain bases named for
+a checkpoint or model version. Remote manifests extend those semantic bases and
+own architecture subsets, serving identities, multimodal behavior, speculation,
+and other model-specific policy. Mappings merge recursively; scalars and lists
+replace inherited values. Unknown fields, duplicate definitions, missing
 parents, inheritance cycles, and invalid resolved types fail closed.
 
 Draft repositories use a separate schema and do not appear as launchable

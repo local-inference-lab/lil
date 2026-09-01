@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	qwenProfile     = "Qwen3.8-Flash-Next-NVFP4"
-	glmFlashProfile = "GLM-5.3-Flash-NVFP4"
-	glmProfile      = "GLM-5.3-NVFP4"
+	qwenProfile          = "Qwen3.8-Flash-Next-NVFP4"
+	glmFlashProfile      = "GLM-5.3-Flash-NVFP4"
+	glmFlashSparkProfile = "GLM-5.3-Flash-NVFP4-Spark"
+	glmProfile           = "GLM-5.3-NVFP4"
+	glmSparkProfile      = "GLM-5.3-NVFP4-Spark"
 )
 
 type testConfig struct {
@@ -160,7 +162,10 @@ func speculativeConfigValue(t *testing.T, spec LaunchSpec) map[string]any {
 
 func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 	config := loadTestConfig(t)
-	want := []string{glmFlashProfile, glmProfile, qwenProfile}
+	want := []string{
+		glmFlashProfile, glmFlashSparkProfile, glmProfile, glmSparkProfile,
+		qwenProfile,
+	}
 	if got := SortedProfileNames(config.profiles); !reflect.DeepEqual(got, want) {
 		t.Fatalf("profile names: got %v, want %v", got, want)
 	}
@@ -269,7 +274,9 @@ func TestEveryModelSupportsEveryValidLocalTP(t *testing.T) {
 	}{
 		{qwenProfile, []int{1, 2, 3, 4, 6, 8, 12}, "W4A16_NVFP4"},
 		{glmFlashProfile, []int{1, 2, 4, 8}, "MXFP8"},
+		{glmFlashSparkProfile, []int{1, 2, 4, 8}, "W4A16_NVFP4"},
 		{glmProfile, []int{1, 2, 4, 8}, ""},
+		{glmSparkProfile, []int{1, 2, 4, 8}, "W4A16_NVFP4"},
 	}
 	for _, test := range tests {
 		t.Run(test.profile, func(t *testing.T) {

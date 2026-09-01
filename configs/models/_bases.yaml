@@ -41,37 +41,3 @@ bases:
     reasoning_parser: glm45
     tool_call_parser: glm47
     mamba_cache_mode: align
-
-  glm-5.3-flash:
-    extends: glm
-    served_model_name: zai-org/GLM-5.3-Flash
-    expected_architectures:
-      - Glm5NextForConditionalGeneration
-    quantization: modelopt_mixed
-    block_size: 256
-    disable_flashinfer_autotune: true
-    default_speculator: mtp
-    mtp_tokens: 5
-    dflash2_tokens: 7
-    mtp_attention_backend: B12X
-    mm_encoder_tp_mode: data
-    mm_processor_cache_gb: 0
-
-  glm-5.3:
-    extends:
-      - glm
-      - full-graph
-    served_model_name: GLM-5.3
-    expected_architectures:
-      - GlmMoeDsaForCausalLM
-    trust_remote_code: true
-    async_scheduling: true
-    generation_config: vllm
-    hf_overrides: {}
-    long_prefill_token_threshold: 2048
-    default_speculator: mtp
-    mtp_tokens: 3
-    mtp_attention_backend: B12X
-    mtp_model: target
-    mtp_draft_sample_method: probabilistic
-    cuda_device_max_connections: 32
