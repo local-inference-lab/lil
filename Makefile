@@ -8,20 +8,16 @@ VERSION ?= $(shell git describe --always --dirty 2>/dev/null || printf dev)
 
 BINARY := bin/lil
 PACKAGE := ./cmd/lil
-GO_SOURCES := $(shell find cmd configs internal -type f -name '*.go' ! -name '*_test.go')
 GO_FILES := $(shell find . -type f -name '*.go' -not -path './bin/*')
-CONFIG_SOURCES := $(shell find configs -type f -name '*.yaml')
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: all build install fmt fmt-check test test-race vet check clean
 
 all: build
 
-build: $(BINARY)
-
-$(BINARY): $(GO_SOURCES) $(CONFIG_SOURCES) go.mod go.sum
-	@mkdir -p $(@D)
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $@ $(PACKAGE)
+build:
+	@mkdir -p $(dir $(BINARY))
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) $(PACKAGE)
 
 install: build
 	install -d $(DESTDIR)$(BINDIR)
