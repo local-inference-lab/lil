@@ -1,9 +1,9 @@
 # lil
 
 `lil` is a standalone Go launcher for local and Spark/RDMA vLLM deployments in
-the local inference lab. It discovers launchable models from the
-`local-inference-lab` Hugging Face account, reads each repository's `lil.yaml`
-and checkpoint metadata at the repository's head commit, combines them with a
+the local inference lab. It reads launch manifests from the catalog
+repository `local-inference-lab/lil-catalog`, reads each model's checkpoint
+metadata from the repository that holds its weights, combines them with a
 discovered machine topology, and produces a typed vLLM invocation. Shell
 launcher scripts, Ray, Python wrappers, and external queueing layers are not
 part of the execution path.
@@ -26,7 +26,7 @@ make install PREFIX=/usr/local
 ```
 
 The executable embeds the model families in `configs/models/_bases.yaml`.
-Per-model manifests and checkpoint facts come from Hugging Face at runtime, and
+Catalog entries and checkpoint facts come from Hugging Face at runtime, and
 topology YAML is generated locally under `~/.config/lil/topologies`.
 
 ## Discover the launch topology
@@ -73,8 +73,8 @@ Every topology carries two policy fields that discovery fills with defaults:
 
 ## Run models
 
-List models carrying a valid `lil.yaml`, their stored size, and the default
-tensor-parallel size on every discovered topology:
+List the catalog's models, their stored size, and the default tensor-parallel
+size on every discovered topology:
 
 ```bash
 lil list
@@ -123,7 +123,7 @@ lil run GLM-5.3-NVFP4 \
 ```
 
 The local checkpoint must declare the same architectures and attention heads
-as the repository at its head commit, and its MTP expert quantization must
+as the repository at its resolved commit, and its MTP expert quantization must
 agree with any assertion in the manifest. Its safetensors index sizes the
 memory estimate. For a Spark topology, `--sync-model` incrementally copies an
 explicit `--model-path` to every rank.
@@ -142,24 +142,24 @@ cannot be overridden.
 
 ## Latest-model and cache contract
 
-`render`, `check`, `run`, and cluster commands resolve the requested repository
-through the Hugging Face API on every invocation. At the repository's head
-commit `lil` reads three things: `lil.yaml`, `config.json`, and the size of
-every safetensors shard. Bytes already cached for that immutable commit are
-reused. Network resolution errors fail the command rather than silently using
-stale model policy.
+Every command resolves the catalog repository's head commit through the
+Hugging Face API on each invocation and reads the requested entry there. It
+then resolves the entry's weight repository, at the pinned revision when the
+entry has one and at head otherwise, and reads `config.json` and the size of
+every safetensors shard at that commit. Bytes already cached for an immutable
+commit are reused. Network resolution errors fail the command rather than
+silently using stale model policy.
 
-For DFlash, the draft repository head is resolved independently, its newest
-manifest is validated as `kind: draft`, and its compatibility list must contain
-the serving model.
+For DFlash, the draft's catalog entry must name the draft repository and list
+the serving model as compatible.
 
-`lil` never emits a model or draft `--revision`. Before a Hub-backed launch,
-`lil run` invokes `hf download OWNER/REPOSITORY` without a revision. The HF CLI
-checks repository head, downloads missing or changed files into the standard
-cache, and streams its progress directly to the terminal. DFlash launches
-update both the serving model and selected draft repositories. An explicit
-`--model-path` skips the serving-model download but still updates any Hub-backed
-draft.
+An unpinned entry never emits `--revision`, and `lil run` invokes
+`hf download OWNER/REPOSITORY` without one: the HF CLI checks repository head,
+downloads missing or changed files into the standard cache, and streams its
+progress to the terminal. A pinned entry emits `--revision` and downloads that
+commit. DFlash launches update both the serving model and the draft
+repository. An explicit `--model-path` skips the serving-model download but
+still updates any Hub-backed draft.
 
 For Spark/RDMA, `lil` updates each rank's cache through SSH. It prefers the `hf`
 executable beside the topology's runtime Python, then checks `PATH`, with
@@ -170,21 +170,19 @@ can still download during startup; that fallback may not expose useful
 progress. A present `hf` command returning an authentication, network, or
 filesystem error fails the run.
 
-`list` may show a cached catalog with an explicit warning when Hugging Face
-discovery is temporarily unavailable. Launch commands do not use that fallback.
+## The catalog
 
-## Model manifests
-
-Every launchable repository in `local-inference-lab` owns one `lil.yaml` at its
-root. The manifest states only what the checkpoint cannot state about itself.
-Architectures, attention heads, stored weight size, and the quantization of the
-MTP expert layer are read from `config.json` and the shard sizes at the
-resolved commit. Identity is the repository; manifests do not name a model or a
-revision.
+Every launchable model is one entry in `local-inference-lab/lil-catalog`: a
+directory named for the model holding a `lil.yaml`. The directory name is the
+launch name. The manifest names the repository that holds the weights and
+states only what the checkpoint cannot state about itself. Architectures,
+attention heads, stored weight size, and the quantization of the MTP expert
+layer are read from `config.json` and the shard sizes at the resolved commit.
 
 ```yaml
 schema_version: 1
 kind: model
+model: local-inference-lab/GLM-5.3-NVFP4
 family: glm
 description: GLM-5.3 with NVFP4 routed experts and an unquantized BF16 MTP expert layer
 serving:
@@ -211,6 +209,13 @@ environment:
 
 The sections:
 
+- `model` names the weight repository in owner/name form; it may belong to
+  any account. `revision` optionally pins a commit. A repository outside
+  `local-inference-lab` that enables `trust_remote_code` must be pinned,
+  because a third-party head is not a trusted input. A pinned entry emits
+  `--revision`, downloads that commit, reads its checkpoint facts there, and
+  carries the pin into a speculative config whose draft lives in the target
+  checkpoint.
 - `family` names one entry in the embedded families file. Family mappings
   merge under the manifest; a scalar, list, or explicit `null` in the manifest
   replaces the family value.
@@ -243,12 +248,14 @@ The sections:
 - `requires.arch` lists the architectures a checkpoint may run on. A launch on
   any other topology fails, and `lil list` marks the topology.
 
-Draft repositories use a separate schema and do not appear as launchable
-models:
+Draft checkpoints are entries of `kind: draft`. They are not listed as
+serving models; a serving entry's `speculators.dflash.model` must match a
+draft entry whose compatibility list contains the serving model's repository:
 
 ```yaml
 schema_version: 1
 kind: draft
+model: local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8
 description: MXFP8 DFlash speculative-decoding draft for GLM-5.3 Flash
 method: dflash
 quantization: mxfp8
@@ -256,62 +263,19 @@ compatible_models:
   - local-inference-lab/GLM-5.3-Flash-NVFP4
 ```
 
-## External models
-
-A model whose weights live in another account gets its manifest from the
-catalog repository `local-inference-lab/lil-catalog`, which holds one
-`<model>/lil.yaml` per entry. The entry name is the launch name. The manifest
-names the upstream repository and, because a third-party head is not a
-trusted input, may pin it:
-
-```yaml
-schema_version: 1
-kind: model
-model: deepseek-ai/DeepSeek-V4-Flash-0731
-revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
-family: deepseek-v4
-description: DeepSeek V4 Flash 0731 with block-FP8 projections, MXFP4 routed experts, and a DSpark draft head
-serving:
-  served_model_name: DeepSeek-V4-Flash-0731
-speculators:
-  default: dspark
-  dspark:
-    tokens: 7
-    model: target
-    draft_sample_method: probabilistic
-    rejection_sample_method: standard
-capacity:
-  max_num_seqs: 16
-  max_num_batched_tokens: 8192
-overrides:
-  - when:
-      speculator: none
-    capacity:
-      max_num_seqs: 64
-```
-
-`revision` is required whenever the entry enables `trust_remote_code`. A
-pinned entry emits `--revision` on the serve command, downloads that commit,
-reads its checkpoint facts at that commit, and carries the pin into a
-speculative config whose draft lives in the target checkpoint. An unpinned
-entry follows the upstream head like an owned repository. A launch name that
-is both an owned repository and a catalog entry fails closed.
-
-`--models-config DIRECTORY` reads manifests from `<model>/lil.yaml` under a
-local directory, with each model's `config.json` and
-`model.safetensors.index.json` beside the manifest, for development and tests.
-An entry with a `model` field is a catalog entry; one without is a
-repository-rooted manifest. The fixtures under
+`--models-config DIRECTORY` reads a local catalog laid out the same way, with
+each model entry's `config.json` and `model.safetensors.index.json` beside its
+manifest, for development and tests. The fixtures under
 `internal/launcher/testdata/model-manifests` are the reference copies of the
-published manifests and catalog entries. Unknown keys, missing families,
-inheritance cycles, and invalid types fail closed.
+published catalog. Unknown keys, missing families, inheritance cycles, and
+invalid types fail closed.
 
 ## Policy ownership
 
 | Concern | Owner |
 | --- | --- |
-| Architectures, attention heads, stored size, MTP expert quantization | repository `config.json` and shard sizes at the resolved commit |
-| Serving identity, parsers, kernel selection, speculation, capacity and compilation layers, conditional overrides | repository `lil.yaml` plus its family |
+| Architectures, attention heads, stored size, MTP expert quantization | weight repository `config.json` and shard sizes at the resolved commit |
+| Weight repository, pinned revision, serving identity, parsers, kernel selection, speculation, capacity and compilation layers, conditional overrides | catalog entry plus its family |
 | GPU inventory, CUDA path, memory-utilization ceiling, default TP policy, host tuning environment, API bind defaults, local pools, SSH/RDMA layout, image, and cache mounts | discovered topology YAML |
 | TP, local checkpoint, bind overrides, KV dtype, scheduler limits, capacity, profiling, speculation overrides, and one-off environment overrides | typed `lil` CLI |
 | Derived environment, default TP fit, graph capture sizes, native commands | Go launcher |

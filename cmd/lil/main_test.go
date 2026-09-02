@@ -39,11 +39,14 @@ func testModelsConfig() string {
 
 func TestListShowsFactsAndPerTopologyDefaults(t *testing.T) {
 	configureTestTopologies(t)
-	profiles, err := loadProfiles(context.Background(), testModelsConfig())
+	loaded, err := loadCatalog(context.Background(), testModelsConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := ansi.Strip(renderList(profiles))
+	if len(loaded.drafts) != 2 {
+		t.Fatalf("draft entries: %v", loaded.drafts)
+	}
+	output := ansi.Strip(renderList(loaded.models))
 	for _, want := range []string{
 		"Models  7\n\n",
 		"DeepSeek-V4-Flash-0731",
@@ -164,5 +167,36 @@ func TestClusterHelpReturnsSuccess(t *testing.T) {
 		if status != 0 || err != nil {
 			t.Errorf("%v: status=%d error=%v", args, status, err)
 		}
+	}
+}
+
+func TestDFlashLaunchValidatesTheDraftEntry(t *testing.T) {
+	configureTestTopologies(t)
+	fs := newFlagSet("render")
+	var values launchFlags
+	configureLaunchFlags(fs, &values, false)
+	values.modelsConfig = testModelsConfig()
+	if err := fs.Parse([]string{"GLM-5.3-Flash-NVFP4", "--speculator", "dflash"}); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := buildSpec(context.Background(), fs, values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Metadata["speculator"] != "dflash" {
+		t.Fatalf("speculator: %v", spec.Metadata["speculator"])
+	}
+	loaded, err := loadCatalog(context.Background(), testModelsConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := loaded.models["GLM-5.3-Flash-NVFP4"]
+	profile.Model = "local-inference-lab/Other"
+	if err := loaded.draftFor(profile); err == nil || !strings.Contains(err.Error(), "not compatible") {
+		t.Fatalf("incompatible draft: %v", err)
+	}
+	profile.Speculators.DFlash.Model = "local-inference-lab/Nope"
+	if err := loaded.draftFor(profile); err == nil || !strings.Contains(err.Error(), "no catalog draft entry") {
+		t.Fatalf("missing draft: %v", err)
 	}
 }

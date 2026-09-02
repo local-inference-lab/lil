@@ -893,160 +893,9 @@ func loadFamilies(familiesData []byte) (map[string]map[string]any, error) {
 	return LoadFamilies(familiesData, "embedded model families")
 }
 
-// resolveManifestDocument validates the manifest envelope and merges the
-// named family under the manifest body. It returns the merged body and the
-// family name.
-func resolveManifestDocument(families map[string]map[string]any, manifestData []byte, label string, extraKeys []string) (map[string]any, map[string]any, string, error) {
-	document, err := parseYAMLDocument(manifestData, label)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	if err := schemaVersionOf(document, label); err != nil {
-		return nil, nil, "", err
-	}
-	kind, ok := document["kind"].(string)
-	if !ok || kind != "model" {
-		return nil, nil, "", fmt.Errorf("%s.kind must be model", label)
-	}
-	optional := append([]string{"family"}, manifestSections...)
-	optional = append(optional, extraKeys...)
-	if err := checkKeys(document, label, []string{"schema_version", "kind"}, optional); err != nil {
-		return nil, nil, "", err
-	}
-	resolved := map[string]any{}
-	familyName := ""
-	if raw, exists := document["family"]; exists && raw != nil {
-		familyName, ok = raw.(string)
-		if !ok || familyName == "" {
-			return nil, nil, "", fmt.Errorf("%s.family must be a family name or null", label)
-		}
-		resolved, err = resolveFamily(families, familyName, nil)
-		if err != nil {
-			return nil, nil, "", fmt.Errorf("%s: %w", label, err)
-		}
-	}
-	overlay := cloneValue(document).(map[string]any)
-	for _, key := range append([]string{"schema_version", "kind", "family"}, extraKeys...) {
-		delete(overlay, key)
-	}
-	return document, deepMerge(resolved, overlay), familyName, nil
-}
-
-// LoadRepositoryModelProfile parses a manifest stored at the root of the
-// model's own repository. The repository ID is the model identity; the
-// manifest may not restate it or pin a revision.
-func LoadRepositoryModelProfile(
-	familiesData, manifestData []byte,
-	repositoryID, manifestCommit, label string,
-) (ModelProfile, error) {
-	if !hfModelID.MatchString(repositoryID) {
-		return ModelProfile{}, fmt.Errorf("repository ID must have owner/name form; got %q", repositoryID)
-	}
-	if manifestCommit != "" && !hfCommit.MatchString(manifestCommit) {
-		return ModelProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", manifestCommit)
-	}
-	families, err := loadFamilies(familiesData)
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	document, err := parseYAMLDocument(manifestData, label)
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	for _, key := range []string{"model", "revision"} {
-		if _, exists := document[key]; exists {
-			return ModelProfile{}, fmt.Errorf("%s must not set %s; the repository is authoritative", label, key)
-		}
-	}
-	_, resolved, familyName, err := resolveManifestDocument(families, manifestData, label, nil)
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	_, name, _ := strings.Cut(repositoryID, "/")
-	profile, err := decodeProfile(name, resolved, label)
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	profile.Model = repositoryID
-	profile.ManifestCommit = manifestCommit
-	profile.Family = familyName
-	return profile, nil
-}
-
-// LoadCatalogModelProfile parses a manifest stored in the catalog
-// repository for a model whose weights live elsewhere. The manifest names
-// the upstream repository and, when the model runs remote code, pins its
-// commit.
-func LoadCatalogModelProfile(
-	familiesData, manifestData []byte,
-	name, catalogCommit, label string,
-) (ModelProfile, error) {
-	if !hfRepositoryName.MatchString(name) {
-		return ModelProfile{}, fmt.Errorf("catalog entry name %q is not a valid repository name", name)
-	}
-	if catalogCommit != "" && !hfCommit.MatchString(catalogCommit) {
-		return ModelProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", catalogCommit)
-	}
-	families, err := loadFamilies(familiesData)
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	document, resolved, familyName, err := resolveManifestDocument(families, manifestData, label, []string{"model", "revision"})
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	root := section{document, label}
-	model, err := root.stringOr("model", "")
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	if !hfModelID.MatchString(model) {
-		return ModelProfile{}, fmt.Errorf("%s.model must name the upstream repository in owner/name form", label)
-	}
-	revision, err := root.stringOr("revision", "")
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	if revision != "" && !hfCommit.MatchString(revision) {
-		return ModelProfile{}, fmt.Errorf("%s.revision must be a 40-character commit SHA", label)
-	}
-	profile, err := decodeProfile(name, resolved, label)
-	if err != nil {
-		return ModelProfile{}, err
-	}
-	if profile.Serving.TrustRemoteCode && revision == "" {
-		return ModelProfile{}, fmt.Errorf(
-			"%s enables trust_remote_code for an external repository and must pin a revision", label,
-		)
-	}
-	profile.Model = model
-	profile.Revision = revision
-	profile.ManifestCommit = catalogCommit
-	profile.Family = familyName
-	return profile, nil
-}
-
-// ManifestNamesModel reports whether a manifest body carries a model field,
-// which distinguishes a catalog entry from a repository-rooted manifest.
-func ManifestNamesModel(manifestData []byte, label string) (bool, error) {
-	document, err := parseYAMLDocument(manifestData, label)
-	if err != nil {
-		return false, err
-	}
-	_, ok := document["model"]
-	return ok, nil
-}
-
-type DraftProfile struct {
-	RepositoryID     string
-	ManifestCommit   string
-	Description      string
-	Method           string
-	Quantization     string
-	CompatibleModels []string
-}
-
-func RepositoryManifestKind(data []byte, label string) (string, error) {
+// ManifestKind reports whether a catalog entry describes a serving model or
+// a speculative-decoding draft.
+func ManifestKind(data []byte, label string) (string, error) {
 	document, err := parseYAMLDocument(data, label)
 	if err != nil {
 		return "", err
@@ -1061,25 +910,118 @@ func RepositoryManifestKind(data []byte, label string) (string, error) {
 	return kind, nil
 }
 
-func LoadRepositoryDraftProfile(
-	manifestData []byte,
-	repositoryID, manifestCommit, label string,
-) (DraftProfile, error) {
-	if !hfModelID.MatchString(repositoryID) {
-		return DraftProfile{}, fmt.Errorf("repository ID must have owner/name form; got %q", repositoryID)
+func entryIdentity(document map[string]any, name, catalogCommit, label string) (string, string, error) {
+	if !hfRepositoryName.MatchString(name) {
+		return "", "", fmt.Errorf("catalog entry name %q is not a valid repository name", name)
 	}
-	if manifestCommit != "" && !hfCommit.MatchString(manifestCommit) {
-		return DraftProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", manifestCommit)
+	if catalogCommit != "" && !hfCommit.MatchString(catalogCommit) {
+		return "", "", fmt.Errorf("catalog commit must be a 40-character SHA; got %q", catalogCommit)
 	}
+	root := section{document, label}
+	model, err := root.stringOr("model", "")
+	if err != nil {
+		return "", "", err
+	}
+	if !hfModelID.MatchString(model) {
+		return "", "", fmt.Errorf("%s.model must name the repository in owner/name form", label)
+	}
+	revision, err := root.stringOr("revision", "")
+	if err != nil {
+		return "", "", err
+	}
+	if revision != "" && !hfCommit.MatchString(revision) {
+		return "", "", fmt.Errorf("%s.revision must be a 40-character commit SHA", label)
+	}
+	return model, revision, nil
+}
+
+// LoadModelEntry parses one catalog entry of kind model. The entry name is
+// the launch name; model names the repository that holds the weights and
+// revision optionally pins it. A repository outside trustedOwner that runs
+// remote code must be pinned, because its head is not a trusted input.
+func LoadModelEntry(
+	familiesData, manifestData []byte,
+	name, catalogCommit, label, trustedOwner string,
+) (ModelProfile, error) {
+	families, err := loadFamilies(familiesData)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	document, err := parseYAMLDocument(manifestData, label)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	if err := schemaVersionOf(document, label); err != nil {
+		return ModelProfile{}, err
+	}
+	kind, ok := document["kind"].(string)
+	if !ok || kind != "model" {
+		return ModelProfile{}, fmt.Errorf("%s.kind must be model", label)
+	}
+	optional := append([]string{"family", "model", "revision"}, manifestSections...)
+	if err := checkKeys(document, label, []string{"schema_version", "kind", "model"}, optional); err != nil {
+		return ModelProfile{}, err
+	}
+	model, revision, err := entryIdentity(document, name, catalogCommit, label)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	resolved := map[string]any{}
+	familyName := ""
+	if raw, exists := document["family"]; exists && raw != nil {
+		familyName, ok = raw.(string)
+		if !ok || familyName == "" {
+			return ModelProfile{}, fmt.Errorf("%s.family must be a family name or null", label)
+		}
+		resolved, err = resolveFamily(families, familyName, nil)
+		if err != nil {
+			return ModelProfile{}, fmt.Errorf("%s: %w", label, err)
+		}
+	}
+	overlay := cloneValue(document).(map[string]any)
+	for _, key := range []string{"schema_version", "kind", "family", "model", "revision"} {
+		delete(overlay, key)
+	}
+	profile, err := decodeProfile(name, deepMerge(resolved, overlay), label)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	owner, _, _ := strings.Cut(model, "/")
+	if profile.Serving.TrustRemoteCode && revision == "" && owner != trustedOwner {
+		return ModelProfile{}, fmt.Errorf(
+			"%s enables trust_remote_code for %s outside %s and must pin a revision", label, model, trustedOwner,
+		)
+	}
+	profile.Model = model
+	profile.Revision = revision
+	profile.ManifestCommit = catalogCommit
+	profile.Family = familyName
+	return profile, nil
+}
+
+// DraftProfile describes a speculative-decoding draft checkpoint listed in
+// the catalog.
+type DraftProfile struct {
+	Name             string
+	Model            string
+	Revision         string
+	ManifestCommit   string
+	Description      string
+	Method           string
+	Quantization     string
+	CompatibleModels []string
+}
+
+// LoadDraftEntry parses one catalog entry of kind draft.
+func LoadDraftEntry(manifestData []byte, name, catalogCommit, label string) (DraftProfile, error) {
 	document, err := parseYAMLDocument(manifestData, label)
 	if err != nil {
 		return DraftProfile{}, err
 	}
 	if err := checkKeys(
-		document,
-		label,
-		[]string{"schema_version", "kind", "description", "method", "quantization", "compatible_models"},
-		nil,
+		document, label,
+		[]string{"schema_version", "kind", "model", "description", "method", "quantization", "compatible_models"},
+		[]string{"revision"},
 	); err != nil {
 		return DraftProfile{}, err
 	}
@@ -1087,13 +1029,17 @@ func LoadRepositoryDraftProfile(
 		return DraftProfile{}, err
 	}
 	kind, kindOK := document["kind"].(string)
+	if !kindOK || kind != "draft" {
+		return DraftProfile{}, fmt.Errorf("%s.kind must be draft", label)
+	}
+	model, revision, err := entryIdentity(document, name, catalogCommit, label)
+	if err != nil {
+		return DraftProfile{}, err
+	}
 	description, descriptionOK := document["description"].(string)
 	method, methodOK := document["method"].(string)
 	quantization, quantizationOK := document["quantization"].(string)
 	compatibleRaw, compatibleOK := document["compatible_models"].([]any)
-	if !kindOK || kind != "draft" {
-		return DraftProfile{}, fmt.Errorf("%s.kind must be draft", label)
-	}
 	if !descriptionOK || description == "" || !methodOK || method != "dflash" || !quantizationOK || quantization == "" {
 		return DraftProfile{}, fmt.Errorf("%s contains invalid draft metadata", label)
 	}
@@ -1102,15 +1048,16 @@ func LoadRepositoryDraftProfile(
 	}
 	compatible := make([]string, 0, len(compatibleRaw))
 	for _, raw := range compatibleRaw {
-		model, ok := raw.(string)
-		if !ok || !hfModelID.MatchString(model) {
+		id, ok := raw.(string)
+		if !ok || !hfModelID.MatchString(id) {
 			return DraftProfile{}, fmt.Errorf("%s.compatible_models must contain Hugging Face model IDs", label)
 		}
-		compatible = append(compatible, model)
+		compatible = append(compatible, id)
 	}
 	return DraftProfile{
-		RepositoryID: repositoryID, ManifestCommit: manifestCommit, Description: description,
-		Method: method, Quantization: quantization, CompatibleModels: compatible,
+		Name: name, Model: model, Revision: revision, ManifestCommit: catalogCommit,
+		Description: description, Method: method, Quantization: quantization,
+		CompatibleModels: compatible,
 	}, nil
 }
 

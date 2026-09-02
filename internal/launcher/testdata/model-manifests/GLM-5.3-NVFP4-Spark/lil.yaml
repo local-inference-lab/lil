@@ -1,5 +1,6 @@
 schema_version: 1
 kind: model
+model: local-inference-lab/GLM-5.3-NVFP4-Spark
 family: glm
 description: GLM-5.3 with NVFP4 routed experts, MXFP8 projections, and an NVFP4 MTP expert layer
 serving:

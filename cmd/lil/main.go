@@ -28,8 +28,6 @@ var version = "dev"
 
 const modelRepositoryOwner = "local-inference-lab"
 
-var catalogRepositoryID = modelRepositoryOwner + "/" + hfhub.CatalogRepositoryName
-
 type launchFlags struct {
 	config                    string
 	modelsConfig              string
@@ -71,7 +69,7 @@ type launchFlags struct {
 
 func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bool) {
 	fs.StringVar(&values.config, "config", "", "discovered topology name or YAML path")
-	fs.StringVar(&values.modelsConfig, "models-config", "", "directory of <model>/lil.yaml manifests with config.json and safetensors index")
+	fs.StringVar(&values.modelsConfig, "models-config", "", "local catalog directory of <model>/lil.yaml entries with config.json and safetensors index")
 	fs.IntVar(&values.tp, "tp", 0, "tensor parallel size")
 	fs.StringVar(&values.devices, "devices", "", "comma-separated local physical GPU IDs")
 	fs.StringVar(&values.modelPath, "model-path", "", "local checkpoint path")
@@ -205,13 +203,16 @@ func embeddedModelFamilies() ([]byte, error) {
 	return configassets.ModelBases.ReadFile("models/_bases.yaml")
 }
 
+// catalog is the set of launchable models and drafts, loaded either from the
+// Hub catalog repository or from a local directory of entries.
+type catalog struct {
+	models map[string]launcher.ModelProfile
+	drafts map[string]launcher.DraftProfile
+}
+
 // hubFacts reads config.json and the safetensors shard sizes at the
-// repository's resolved commit.
+// repository listing's commit.
 func hubFacts(ctx context.Context, client *hfhub.Client, repository hfhub.Repository) (*launcher.CheckpointFacts, error) {
-	sizes, _, err := client.FetchSizes(ctx, repository)
-	if err != nil {
-		return nil, err
-	}
 	data, _, err := client.FetchFile(ctx, repository, "config.json", hfhub.ConfigLimit)
 	if err != nil {
 		return nil, err
@@ -221,131 +222,110 @@ func hubFacts(ctx context.Context, client *hfhub.Client, repository hfhub.Reposi
 	if err != nil {
 		return nil, err
 	}
-	return launcher.FactsFromConfig(config, hfhub.SafetensorsBytes(sizes), "Hub safetensors file sizes", source)
+	return launcher.FactsFromConfig(config, repository.SafetensorsBytes(), "Hub safetensors file sizes", source)
 }
 
-// externalFacts reads the upstream checkpoint metadata for a catalog entry at
-// its pinned revision, or at head when the entry is unpinned.
-func externalFacts(ctx context.Context, client *hfhub.Client, profile launcher.ModelProfile) (*launcher.CheckpointFacts, error) {
+func hubModelEntry(ctx context.Context, client *hfhub.Client, families []byte, catalogRepository hfhub.Repository, name string) (launcher.ModelProfile, error) {
+	label := catalogRepository.ID + "/" + name + "/lil.yaml"
+	manifest, _, err := client.FetchFile(ctx, catalogRepository, name+"/lil.yaml", hfhub.ManifestLimit)
+	if err != nil {
+		return launcher.ModelProfile{}, err
+	}
+	profile, err := launcher.LoadModelEntry(families, manifest, name, catalogRepository.Revision, label, modelRepositoryOwner)
+	if err != nil {
+		return launcher.ModelProfile{}, err
+	}
 	upstream, err := client.ResolveAt(ctx, profile.Model, profile.Revision)
 	if err != nil {
-		return nil, err
-	}
-	return hubFacts(ctx, client, upstream)
-}
-
-func catalogModelProfile(ctx context.Context, client *hfhub.Client, families []byte, catalog hfhub.Repository, name string) (launcher.ModelProfile, error) {
-	label := catalog.ID + "/" + name + "/lil.yaml"
-	manifest, _, err := client.FetchFile(ctx, catalog, name+"/lil.yaml", hfhub.ManifestLimit)
-	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
-	profile, err := launcher.LoadCatalogModelProfile(families, manifest, name, catalog.Revision, label)
-	if err != nil {
-		return launcher.ModelProfile{}, err
-	}
-	profile.Facts, err = externalFacts(ctx, client, profile)
+	profile.Facts, err = hubFacts(ctx, client, upstream)
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
 	return profile, nil
 }
 
-// resolveCatalog returns the catalog repository listing, or false when the
-// owner has no catalog repository.
-func resolveCatalog(ctx context.Context, client *hfhub.Client) (hfhub.Repository, bool, error) {
-	catalog, err := client.Resolve(ctx, catalogRepositoryID)
+func hubDraftEntry(ctx context.Context, client *hfhub.Client, catalogRepository hfhub.Repository, name string) (launcher.DraftProfile, error) {
+	label := catalogRepository.ID + "/" + name + "/lil.yaml"
+	manifest, _, err := client.FetchFile(ctx, catalogRepository, name+"/lil.yaml", hfhub.ManifestLimit)
+	if err != nil {
+		return launcher.DraftProfile{}, err
+	}
+	return launcher.LoadDraftEntry(manifest, name, catalogRepository.Revision, label)
+}
+
+func hubEntryKind(ctx context.Context, client *hfhub.Client, catalogRepository hfhub.Repository, name string) (string, error) {
+	label := catalogRepository.ID + "/" + name + "/lil.yaml"
+	manifest, _, err := client.FetchFile(ctx, catalogRepository, name+"/lil.yaml", hfhub.ManifestLimit)
+	if err != nil {
+		return "", err
+	}
+	return launcher.ManifestKind(manifest, label)
+}
+
+func resolveCatalogRepository(ctx context.Context, client *hfhub.Client) (hfhub.Repository, error) {
+	repository, err := client.Resolve(ctx, client.CatalogID())
 	if errors.Is(err, hfhub.ErrNotFound) {
-		return hfhub.Repository{}, false, nil
+		return hfhub.Repository{}, fmt.Errorf("catalog repository %s does not exist", client.CatalogID())
 	}
-	if err != nil {
-		return hfhub.Repository{}, false, err
-	}
-	return catalog, true, nil
+	return repository, err
 }
 
-func hubModelProfile(ctx context.Context, client *hfhub.Client, families []byte, repository hfhub.Repository) (launcher.ModelProfile, string, error) {
-	label := repository.ID + "/lil.yaml"
-	manifest, _, err := client.FetchManifest(ctx, repository)
-	if err != nil {
-		return launcher.ModelProfile{}, "", err
-	}
-	kind, err := launcher.RepositoryManifestKind(manifest, label)
-	if err != nil {
-		return launcher.ModelProfile{}, "", err
-	}
-	if kind == "draft" {
-		_, err := launcher.LoadRepositoryDraftProfile(manifest, repository.ID, repository.Revision, label)
-		return launcher.ModelProfile{}, kind, err
-	}
-	profile, err := launcher.LoadRepositoryModelProfile(families, manifest, repository.ID, repository.Revision, label)
-	if err != nil {
-		return launcher.ModelProfile{}, "", err
-	}
-	profile.Facts, err = hubFacts(ctx, client, repository)
-	if err != nil {
-		return launcher.ModelProfile{}, "", err
-	}
-	return profile, kind, nil
-}
-
-func loadProfiles(ctx context.Context, path string) (map[string]launcher.ModelProfile, error) {
+// loadHubCatalog loads every entry of the catalog repository at its head.
+func loadHubCatalog(ctx context.Context) (catalog, error) {
 	families, err := embeddedModelFamilies()
 	if err != nil {
-		return nil, err
+		return catalog{}, err
 	}
-	if path == "" {
-		client, err := hfhub.DefaultClient(modelRepositoryOwner)
+	client, err := hfhub.DefaultClient(modelRepositoryOwner)
+	if err != nil {
+		return catalog{}, err
+	}
+	repository, err := resolveCatalogRepository(ctx, client)
+	if err != nil {
+		return catalog{}, err
+	}
+	result := catalog{models: map[string]launcher.ModelProfile{}, drafts: map[string]launcher.DraftProfile{}}
+	for _, name := range repository.CatalogEntries() {
+		kind, err := hubEntryKind(ctx, client, repository, name)
 		if err != nil {
-			return nil, err
+			return catalog{}, err
 		}
-		discovery, err := client.Discover(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if discovery.Warning != "" {
-			fmt.Fprintln(os.Stderr, "warning:", discovery.Warning)
-		}
-		profiles := map[string]launcher.ModelProfile{}
-		for _, repository := range discovery.Repositories {
-			if !repository.HasFile("lil.yaml") {
-				continue
-			}
-			profile, kind, err := hubModelProfile(ctx, client, families, repository)
+		if kind == "draft" {
+			draft, err := hubDraftEntry(ctx, client, repository, name)
 			if err != nil {
-				return nil, err
+				return catalog{}, err
 			}
-			if kind == "model" {
-				profiles[profile.Name] = profile
-			}
+			result.drafts[name] = draft
+			continue
 		}
-		catalog, ok, err := resolveCatalog(ctx, client)
+		profile, err := hubModelEntry(ctx, client, families, repository, name)
 		if err != nil {
-			return nil, err
+			return catalog{}, err
 		}
-		if ok {
-			for _, name := range catalog.CatalogEntries() {
-				if _, duplicate := profiles[name]; duplicate {
-					return nil, fmt.Errorf("model %q is defined both as a repository and as a catalog entry", name)
-				}
-				profile, err := catalogModelProfile(ctx, client, families, catalog, name)
-				if err != nil {
-					return nil, err
-				}
-				profiles[name] = profile
-			}
-		}
-		return profiles, nil
+		result.models[name] = profile
+	}
+	return result, nil
+}
+
+// loadDirectoryCatalog loads <name>/lil.yaml entries from a local directory.
+// Model entries read their checkpoint facts from config.json and the
+// safetensors index beside the manifest.
+func loadDirectoryCatalog(path string) (catalog, error) {
+	families, err := embeddedModelFamilies()
+	if err != nil {
+		return catalog{}, err
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return nil, err
+		return catalog{}, err
 	}
 	entries, err := os.ReadDir(abs)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read model manifest directory %s: %w", abs, err)
+		return catalog{}, fmt.Errorf("cannot read catalog directory %s: %w", abs, err)
 	}
-	profiles := map[string]launcher.ModelProfile{}
+	result := catalog{models: map[string]launcher.ModelProfile{}, drafts: map[string]launcher.DraftProfile{}}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -357,137 +337,144 @@ func loadProfiles(ctx context.Context, path string) (map[string]launcher.ModelPr
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("cannot read %s: %w", manifestPath, err)
+			return catalog{}, fmt.Errorf("cannot read %s: %w", manifestPath, err)
 		}
-		kind, err := launcher.RepositoryManifestKind(data, manifestPath)
+		kind, err := launcher.ManifestKind(data, manifestPath)
 		if err != nil {
-			return nil, err
+			return catalog{}, err
 		}
-		repositoryID := modelRepositoryOwner + "/" + entry.Name()
 		if kind == "draft" {
-			if _, err := launcher.LoadRepositoryDraftProfile(data, repositoryID, "", manifestPath); err != nil {
-				return nil, err
+			draft, err := launcher.LoadDraftEntry(data, entry.Name(), "", manifestPath)
+			if err != nil {
+				return catalog{}, err
 			}
+			result.drafts[entry.Name()] = draft
 			continue
 		}
-		external, err := launcher.ManifestNamesModel(data, manifestPath)
+		profile, err := launcher.LoadModelEntry(families, data, entry.Name(), "", manifestPath, modelRepositoryOwner)
 		if err != nil {
-			return nil, err
-		}
-		var profile launcher.ModelProfile
-		if external {
-			profile, err = launcher.LoadCatalogModelProfile(families, data, entry.Name(), "", manifestPath)
-		} else {
-			profile, err = launcher.LoadRepositoryModelProfile(families, data, repositoryID, "", manifestPath)
-		}
-		if err != nil {
-			return nil, err
+			return catalog{}, err
 		}
 		profile.Facts, err = launcher.LoadCheckpointFacts(directory)
 		if err != nil {
-			return nil, err
+			return catalog{}, err
 		}
-		profiles[profile.Name] = profile
+		result.models[entry.Name()] = profile
 	}
-	if len(profiles) == 0 {
-		return nil, fmt.Errorf("no <model>/lil.yaml manifests were found under %s", abs)
+	if len(result.models) == 0 {
+		return catalog{}, fmt.Errorf("no <model>/lil.yaml entries were found under %s", abs)
 	}
-	return profiles, nil
+	return result, nil
 }
 
-func profileFromMap(profiles map[string]launcher.ModelProfile, model string) (launcher.ModelProfile, error) {
-	name := model
-	if _, basename, ok := strings.Cut(model, "/"); ok {
-		name = basename
+func loadCatalog(ctx context.Context, path string) (catalog, error) {
+	if path == "" {
+		return loadHubCatalog(ctx)
 	}
-	profile, ok := profiles[name]
+	return loadDirectoryCatalog(path)
+}
+
+// launchName maps a requested model, given as a catalog name or an
+// owner/name repository ID, to its catalog entry name.
+func launchName(model string) string {
+	if _, name, ok := strings.Cut(model, "/"); ok {
+		return name
+	}
+	return model
+}
+
+func (c catalog) model(model string) (launcher.ModelProfile, error) {
+	profile, ok := c.models[launchName(model)]
 	if !ok {
 		return launcher.ModelProfile{}, fmt.Errorf(
-			"unknown model profile %q; choose one of: %s",
-			model, strings.Join(launcher.SortedProfileNames(profiles), ", "),
+			"unknown model %q; choose one of: %s",
+			model, strings.Join(launcher.SortedProfileNames(c.models), ", "),
 		)
 	}
 	return profile, nil
 }
 
-func resolveModelProfile(ctx context.Context, model, modelsConfig string) (launcher.ModelProfile, error) {
-	if modelsConfig != "" {
-		profiles, err := loadProfiles(ctx, modelsConfig)
-		if err != nil {
-			return launcher.ModelProfile{}, err
-		}
-		return profileFromMap(profiles, model)
-	}
-	client, err := hfhub.DefaultClient(modelRepositoryOwner)
-	if err != nil {
-		return launcher.ModelProfile{}, err
-	}
-	families, err := embeddedModelFamilies()
-	if err != nil {
-		return launcher.ModelProfile{}, err
-	}
-	repository, err := client.Resolve(ctx, model)
-	if err == nil && repository.HasFile("lil.yaml") {
-		profile, kind, err := hubModelProfile(ctx, client, families, repository)
-		if err != nil {
-			return launcher.ModelProfile{}, err
-		}
-		if kind == "draft" {
-			return launcher.ModelProfile{}, fmt.Errorf("%s is a DFlash draft checkpoint and cannot be launched as a serving model", repository.ID)
-		}
-		return profile, nil
-	}
-	if err != nil && !errors.Is(err, hfhub.ErrNotFound) {
-		return launcher.ModelProfile{}, err
-	}
-	_, name, _ := strings.Cut(model, "/")
-	if name == "" {
-		name = model
-	}
-	catalog, ok, catalogErr := resolveCatalog(ctx, client)
-	if catalogErr != nil {
-		return launcher.ModelProfile{}, catalogErr
-	}
-	if ok && slices.Contains(catalog.CatalogEntries(), name) {
-		return catalogModelProfile(ctx, client, families, catalog, name)
-	}
-	if err == nil {
-		return launcher.ModelProfile{}, fmt.Errorf("%s does not contain lil.yaml", repository.ID)
-	}
-	return launcher.ModelProfile{}, fmt.Errorf("model %q is neither a %s repository with lil.yaml nor a %s entry", model, modelRepositoryOwner, catalogRepositoryID)
-}
-
-func validateHubDraftProfile(ctx context.Context, profile launcher.ModelProfile) error {
+// draftFor finds the catalog draft entry whose repository a serving model's
+// DFlash speculator names, and checks that the draft lists the serving
+// model as compatible.
+func (c catalog) draftFor(profile launcher.ModelProfile) error {
 	if profile.Speculators.DFlash == nil {
 		return fmt.Errorf("model %q does not define a DFlash draft repository", profile.Name)
 	}
-	client, err := hfhub.DefaultClient(modelRepositoryOwner)
-	if err != nil {
-		return err
-	}
-	repository, err := client.Resolve(ctx, profile.Speculators.DFlash.Model)
-	if err != nil {
-		return err
-	}
-	manifest, _, err := client.FetchManifest(ctx, repository)
-	if err != nil {
-		return err
-	}
-	draft, err := launcher.LoadRepositoryDraftProfile(
-		manifest, repository.ID, repository.Revision, repository.ID+"/lil.yaml",
-	)
-	if err != nil {
-		return err
-	}
-	for _, compatible := range draft.CompatibleModels {
-		if compatible == profile.Model {
+	for _, draft := range c.drafts {
+		if draft.Model != profile.Speculators.DFlash.Model {
+			continue
+		}
+		if slices.Contains(draft.CompatibleModels, profile.Model) {
 			return nil
 		}
+		return fmt.Errorf(
+			"draft %s is not compatible with %s according to its catalog entry %q",
+			draft.Model, profile.Model, draft.Name,
+		)
 	}
-	return fmt.Errorf(
-		"DFlash repository %s is not compatible with %s according to its latest lil.yaml",
-		draft.RepositoryID, profile.Model,
-	)
+	return fmt.Errorf("no catalog draft entry names %s", profile.Speculators.DFlash.Model)
+}
+
+// resolveLaunch loads one model entry and, when a DFlash launch is possible,
+// every draft entry, without reading facts for the rest of the catalog.
+func resolveLaunch(ctx context.Context, model, modelsConfig string) (launcher.ModelProfile, catalog, error) {
+	if modelsConfig != "" {
+		loaded, err := loadDirectoryCatalog(modelsConfig)
+		if err != nil {
+			return launcher.ModelProfile{}, catalog{}, err
+		}
+		profile, err := loaded.model(model)
+		return profile, loaded, err
+	}
+	families, err := embeddedModelFamilies()
+	if err != nil {
+		return launcher.ModelProfile{}, catalog{}, err
+	}
+	client, err := hfhub.DefaultClient(modelRepositoryOwner)
+	if err != nil {
+		return launcher.ModelProfile{}, catalog{}, err
+	}
+	repository, err := resolveCatalogRepository(ctx, client)
+	if err != nil {
+		return launcher.ModelProfile{}, catalog{}, err
+	}
+	name := launchName(model)
+	entries := repository.CatalogEntries()
+	if !slices.Contains(entries, name) {
+		return launcher.ModelProfile{}, catalog{}, fmt.Errorf(
+			"unknown model %q; %s lists: %s", model, repository.ID, strings.Join(entries, ", "),
+		)
+	}
+	kind, err := hubEntryKind(ctx, client, repository, name)
+	if err != nil {
+		return launcher.ModelProfile{}, catalog{}, err
+	}
+	if kind == "draft" {
+		return launcher.ModelProfile{}, catalog{}, fmt.Errorf("%s is a draft checkpoint and cannot be launched as a serving model", name)
+	}
+	profile, err := hubModelEntry(ctx, client, families, repository, name)
+	if err != nil {
+		return launcher.ModelProfile{}, catalog{}, err
+	}
+	loaded := catalog{models: map[string]launcher.ModelProfile{name: profile}, drafts: map[string]launcher.DraftProfile{}}
+	if profile.Speculators.DFlash != nil {
+		for _, entry := range entries {
+			kind, err := hubEntryKind(ctx, client, repository, entry)
+			if err != nil {
+				return launcher.ModelProfile{}, catalog{}, err
+			}
+			if kind != "draft" {
+				continue
+			}
+			draft, err := hubDraftEntry(ctx, client, repository, entry)
+			if err != nil {
+				return launcher.ModelProfile{}, catalog{}, err
+			}
+			loaded.drafts[entry] = draft
+		}
+	}
+	return profile, loaded, nil
 }
 
 func buildSpec(ctx context.Context, fs *pflag.FlagSet, values launchFlags) (launcher.LaunchSpec, error) {
@@ -500,7 +487,7 @@ func buildSpec(ctx context.Context, fs *pflag.FlagSet, values launchFlags) (laun
 	if dash >= 0 {
 		extraArgs = append(extraArgs, args[dash:]...)
 	}
-	profile, err := resolveModelProfile(ctx, args[0], values.modelsConfig)
+	profile, loaded, err := resolveLaunch(ctx, args[0], values.modelsConfig)
 	if err != nil {
 		return launcher.LaunchSpec{}, err
 	}
@@ -525,8 +512,8 @@ func buildSpec(ctx context.Context, fs *pflag.FlagSet, values launchFlags) (laun
 	if err != nil {
 		return launcher.LaunchSpec{}, err
 	}
-	if values.modelsConfig == "" && spec.Metadata["speculator"] == "dflash" && spec.Metadata["speculative_tokens"] != 0 {
-		if err := validateHubDraftProfile(ctx, profile); err != nil {
+	if spec.Metadata["speculator"] == "dflash" {
+		if err := loaded.draftFor(profile); err != nil {
 			return launcher.LaunchSpec{}, err
 		}
 	}
@@ -554,18 +541,18 @@ func newFlagSet(command string) *pflag.FlagSet {
 
 func listCommand(ctx context.Context, args []string) error {
 	fs := newFlagSet("list")
-	modelsConfig := fs.String("models-config", "", "directory of <model>/lil.yaml manifests")
+	modelsConfig := fs.String("models-config", "", "local catalog directory of <model>/lil.yaml entries")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("list takes no positional arguments")
 	}
-	profiles, err := loadProfiles(ctx, *modelsConfig)
+	loaded, err := loadCatalog(ctx, *modelsConfig)
 	if err != nil {
 		return err
 	}
-	return printList(profiles)
+	return printList(loaded.models)
 }
 
 func printChecks(results []launcher.CheckResult) bool {
@@ -705,7 +692,7 @@ func clusterTarget(ctx context.Context, fs *pflag.FlagSet, values clusterFlags) 
 	if fs.NArg() != 1 {
 		return launcher.SparkTarget{}, fmt.Errorf("cluster operation requires exactly one MODEL")
 	}
-	profile, err := resolveModelProfile(ctx, fs.Arg(0), values.modelsConfig)
+	profile, _, err := resolveLaunch(ctx, fs.Arg(0), values.modelsConfig)
 	if err != nil {
 		return launcher.SparkTarget{}, err
 	}
@@ -750,7 +737,7 @@ Actions:
 	fs.SetOutput(os.Stderr)
 	values := clusterFlags{}
 	fs.StringVar(&values.config, "config", "", "discovered Spark topology name or YAML path")
-	fs.StringVar(&values.modelsConfig, "models-config", "", "directory of <model>/lil.yaml manifests")
+	fs.StringVar(&values.modelsConfig, "models-config", "", "local catalog directory of <model>/lil.yaml entries")
 	fs.IntVar(&values.tp, "tp", 0, "tensor parallel size used by the cluster")
 	fs.IntVar(&values.port, "port", 0, "head API port")
 	fs.IntVar(&values.rank, "rank", 0, "rank whose logs to show")
@@ -816,7 +803,7 @@ func usage() {
 Build deterministic local or Spark/RDMA vLLM launches.
 
 Commands:
-  list      Discover launchable Hugging Face models and local topologies.
+  list      List the catalog's launchable models and local topologies.
   discover  Discover and save a local or Spark/RDMA topology.
   render    Render the resolved environment and command without executing it.
   check     Run read-only launch preflight checks.

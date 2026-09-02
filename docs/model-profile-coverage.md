@@ -1,27 +1,27 @@
 # Hugging Face model coverage
 
-Model coverage is dynamic. A repository is launchable when it belongs to the
-`local-inference-lab` Hugging Face account, its root `lil.yaml` has
-`kind: model`, and its `config.json` and safetensors shards are readable at the
-repository's head commit. A model published by another account is launchable
-when the catalog repository `local-inference-lab/lil-catalog` holds a
-`<model>/lil.yaml` entry naming it. `lil list` is the authoritative inventory
-and shows the default tensor-parallel size on every discovered topology.
+Model coverage is dynamic. A model is launchable when the catalog repository
+`local-inference-lab/lil-catalog` holds a `<model>/lil.yaml` entry of
+`kind: model` and the weight repository the entry names has readable
+`config.json` and safetensors shards at the resolved commit. `lil list` is
+the authoritative inventory and shows the default tensor-parallel size on
+every discovered topology.
 
-Repositories with `kind: draft` describe speculative-decoding checkpoints.
-They are validated during discovery but are not listed as serving targets. A
-serving manifest references a compatible draft repository by Hugging Face ID.
+Entries of `kind: draft` describe speculative-decoding checkpoints. They are
+validated when the catalog loads but are not listed as serving targets. A
+serving entry names its draft repository, and the draft entry lists the
+serving repositories it is compatible with.
 
 The executable contains no per-model inventory, no checkpoint facts, and no
 model revisions. It embeds only the model families in
 `configs/models/_bases.yaml`, which describe contracts shared by several
-repositories: parsers, kernel selection, and environment a family needs. A
-checkpoint name, model version, or one-repository convenience does not belong
-in a family.
+entries: parsers, kernel selection, and environment a family needs. A
+checkpoint name, model version, or one-entry convenience does not belong in a
+family.
 
-A manifest contains only what the checkpoint cannot state about itself:
+An entry contains only what the checkpoint cannot state about itself:
 
-- for a catalog entry, the upstream repository and its pinned commit;
+- the weight repository and, when qualified or required, its pinned commit;
 - the family, when one applies;
 - the served model name and API-facing serving policy;
 - kernel and loader selection that differs from the launcher defaults;
@@ -30,7 +30,7 @@ A manifest contains only what the checkpoint cannot state about itself:
 - architectures the checkpoint requires.
 
 Architectures, attention heads, stored weight size, and MTP expert quantization
-are read from the repository. Host paths, device IDs, ports, GPU
+are read from the weight repository. Host paths, device IDs, ports, GPU
 memory-utilization defaults, CUDA locations, container images, RDMA
 interfaces, cache locations, host tuning environment, and repository revisions
 belong to topology YAML or the launcher, never to a manifest.
@@ -58,7 +58,7 @@ is qualified when:
 
 When a launcher in a vLLM working tree carries policy not represented by an
 existing family, the missing behavior belongs in the typed Go builder or a
-family. Copying a shell launcher into a large model-specific manifest is
+family. Copying a shell launcher into a large model-specific entry is
 unsupported.
 
 ## DeepSeek V4 Flash

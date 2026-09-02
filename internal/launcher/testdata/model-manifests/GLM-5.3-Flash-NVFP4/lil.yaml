@@ -1,5 +1,6 @@
 schema_version: 1
 kind: model
+model: local-inference-lab/GLM-5.3-Flash-NVFP4
 family: glm
 description: GLM-5.3 Flash with NVFP4 routed experts and an MXFP8 MTP expert layer
 serving:

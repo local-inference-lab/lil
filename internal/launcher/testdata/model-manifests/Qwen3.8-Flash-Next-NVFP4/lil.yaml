@@ -1,5 +1,6 @@
 schema_version: 1
 kind: model
+model: local-inference-lab/Qwen3.8-Flash-Next-NVFP4
 description: Qwen3.8 Flash Next with NVFP4 routed experts and MTP, plus MXFP8 attention and shared experts
 serving:
   served_model_name: Qwen3.8-Flash-Next

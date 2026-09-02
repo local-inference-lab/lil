@@ -29,6 +29,7 @@ const (
 
 type testConfig struct {
 	profiles map[string]ModelProfile
+	drafts   map[string]DraftProfile
 	local    Topology
 	spark    Topology
 	families []byte
@@ -54,6 +55,7 @@ func loadTestConfig(t *testing.T) testConfig {
 		t.Fatal(err)
 	}
 	profiles := map[string]ModelProfile{}
+	drafts := map[string]DraftProfile{}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -63,18 +65,19 @@ func loadTestConfig(t *testing.T) testConfig {
 		if err != nil {
 			t.Fatal(err)
 		}
-		external, err := ManifestNamesModel(data, directory+"/lil.yaml")
+		kind, err := ManifestKind(data, directory+"/lil.yaml")
 		if err != nil {
 			t.Fatal(err)
 		}
-		var profile ModelProfile
-		if external {
-			profile, err = LoadCatalogModelProfile(families, data, entry.Name(), testCommit, directory+"/lil.yaml")
-		} else {
-			profile, err = LoadRepositoryModelProfile(
-				families, data, "local-inference-lab/"+entry.Name(), testCommit, directory+"/lil.yaml",
-			)
+		if kind == "draft" {
+			draft, err := LoadDraftEntry(data, entry.Name(), testCommit, directory+"/lil.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			drafts[entry.Name()] = draft
+			continue
 		}
+		profile, err := LoadModelEntry(families, data, entry.Name(), testCommit, directory+"/lil.yaml", "local-inference-lab")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +95,7 @@ func loadTestConfig(t *testing.T) testConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return testConfig{profiles: profiles, local: local, spark: spark, families: families}
+	return testConfig{profiles: profiles, drafts: drafts, local: local, spark: spark, families: families}
 }
 
 // writeCheckpoint creates a metadata-only checkpoint whose config.json names
@@ -179,9 +182,12 @@ func speculativeConfigValue(t *testing.T, spec LaunchSpec) map[string]any {
 	return value
 }
 
+// loadManifest parses an owned catalog entry whose repository name matches
+// the entry name.
 func loadManifest(t *testing.T, families []byte, name, manifest string) (ModelProfile, error) {
 	t.Helper()
-	return LoadRepositoryModelProfile(families, []byte(manifest), "local-inference-lab/"+name, testCommit, name+"/lil.yaml")
+	entry := strings.Replace(manifest, "kind: model\n", "kind: model\nmodel: local-inference-lab/"+name+"\n", 1)
+	return LoadModelEntry(families, []byte(entry), name, testCommit, name+"/lil.yaml", "local-inference-lab")
 }
 
 func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
@@ -224,47 +230,48 @@ func TestCheckpointFactsComeFromTheCheckpointNotTheManifest(t *testing.T) {
 	}
 }
 
-func TestRepositoryManifestsInjectIdentityAndSeparateDrafts(t *testing.T) {
+func TestCatalogEntriesCarryIdentityAndSeparateDrafts(t *testing.T) {
 	config := loadTestConfig(t)
-	profile, err := loadManifest(t, config.families, "Repository-Model", `schema_version: 1
+	profile, err := loadManifest(t, config.families, "Entry-Model", `schema_version: 1
 kind: model
 family: glm
-description: Repository model
+description: Catalog model
 serving:
   served_model_name: served
 `)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.Name != "Repository-Model" || profile.Model != "local-inference-lab/Repository-Model" ||
-		profile.ManifestCommit != testCommit || profile.Family != "glm" {
-		t.Fatalf("repository identity was not injected: %+v", profile)
+	if profile.Name != "Entry-Model" || profile.Model != "local-inference-lab/Entry-Model" ||
+		profile.ManifestCommit != testCommit || profile.Family != "glm" || profile.Revision != "" {
+		t.Fatalf("entry identity: %+v", profile)
 	}
 	if profile.Speculators.Default != "none" || profile.Kernels.Attention == nil || *profile.Kernels.Attention != "B12X" {
 		t.Fatalf("family defaults were not applied: %+v", profile)
 	}
-
+	if len(config.drafts) != 2 {
+		t.Fatalf("draft entries: %+v", config.drafts)
+	}
+	draft := config.drafts["GLM-5.3-Flash-DFlash2-MXFP8"]
+	if draft.Model != "local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8" || draft.Method != "dflash" ||
+		!slices.Contains(draft.CompatibleModels, config.profiles[glmFlashProfile].Model) {
+		t.Fatalf("unexpected draft entry: %+v", draft)
+	}
 	draftManifest := []byte(`schema_version: 1
 kind: draft
+model: local-inference-lab/Draft
 description: DFlash draft
 method: dflash
 quantization: mxfp8
 compatible_models:
-  - local-inference-lab/Repository-Model
+  - local-inference-lab/Entry-Model
 `)
-	draft, err := LoadRepositoryDraftProfile(
-		draftManifest, "local-inference-lab/Repository-Draft", testCommit, "lil.yaml",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if draft.Method != "dflash" || draft.CompatibleModels[0] != profile.Model {
-		t.Fatalf("unexpected draft profile: %+v", draft)
-	}
-	if _, err := LoadRepositoryModelProfile(
-		config.families, draftManifest, draft.RepositoryID, testCommit, "lil.yaml",
-	); err == nil || !strings.Contains(err.Error(), "kind must be model") {
+	if _, err := LoadModelEntry(config.families, draftManifest, "Draft", testCommit, "lil.yaml", "local-inference-lab"); err == nil ||
+		!strings.Contains(err.Error(), "kind must be model") {
 		t.Fatalf("draft accepted as serving model: %v", err)
+	}
+	if kind, err := ManifestKind(draftManifest, "lil.yaml"); err != nil || kind != "draft" {
+		t.Fatalf("draft kind: %q %v", kind, err)
 	}
 }
 
@@ -301,7 +308,6 @@ func TestManifestSchemaFailsClosed(t *testing.T) {
 		want     string
 	}{
 		"unknown key":                     {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nweight_bytes: 1\n", "unknown keys"},
-		"model restated":                  {"schema_version: 1\nkind: model\nmodel: a/b\ndescription: x\nserving: {served_model_name: x}\n", "must not set model"},
 		"unknown family":                  {"schema_version: 1\nkind: model\nfamily: nope\ndescription: x\nserving: {served_model_name: x}\n", "unknown model family"},
 		"mtp default without section":     {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nspeculators: {default: mtp}\n", "no mtp section"},
 		"auto tool choice without parser": {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x, auto_tool_choice: true}\n", "requires tool_call_parser"},
@@ -1161,31 +1167,37 @@ func TestShellAndJSONRenderExposeResolvedCommand(t *testing.T) {
 	}
 }
 
-func TestCatalogManifestNamesUpstreamAndPinsRemoteCode(t *testing.T) {
+func TestCatalogEntriesPinRemoteCodeOutsideTheTrustedOwner(t *testing.T) {
 	config := loadTestConfig(t)
 	deepseek := config.profiles[deepseekProfile]
 	if deepseek.Model != "deepseek-ai/DeepSeek-V4-Flash-0731" || deepseek.Revision != deepseekRevision ||
 		deepseek.Family != "deepseek-v4" || !deepseek.Serving.TrustRemoteCode {
 		t.Fatalf("catalog identity: %+v", deepseek)
 	}
+	glm := config.profiles[glmProfile]
+	if !glm.Serving.TrustRemoteCode || glm.Revision != "" {
+		t.Fatalf("owned entries with remote code follow head: %+v", glm)
+	}
+	load := func(name, manifest string) error {
+		_, err := LoadModelEntry(config.families, []byte(manifest), name, testCommit, name+"/lil.yaml", "local-inference-lab")
+		return err
+	}
 	unpinned := "schema_version: 1\nkind: model\nmodel: deepseek-ai/DeepSeek-V4-Flash\ndescription: x\nserving: {served_model_name: x, trust_remote_code: true}\n"
-	if _, err := LoadCatalogModelProfile(config.families, []byte(unpinned), "Unpinned", testCommit, "lil.yaml"); err == nil ||
-		!strings.Contains(err.Error(), "pin a revision") {
-		t.Fatalf("unpinned remote-code entry: %v", err)
+	if err := load("Unpinned", unpinned); err == nil || !strings.Contains(err.Error(), "pin a revision") {
+		t.Fatalf("unpinned external remote-code entry: %v", err)
 	}
 	safe := "schema_version: 1\nkind: model\nmodel: someone/Model\ndescription: x\nserving: {served_model_name: x}\n"
-	profile, err := LoadCatalogModelProfile(config.families, []byte(safe), "Safe", testCommit, "lil.yaml")
-	if err != nil || profile.Model != "someone/Model" || profile.Revision != "" {
-		t.Fatalf("unpinned entry without remote code: %+v %v", profile, err)
+	if err := load("Safe", safe); err != nil {
+		t.Fatalf("unpinned external entry without remote code: %v", err)
 	}
 	missing := "schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\n"
-	if _, err := LoadCatalogModelProfile(config.families, []byte(missing), "Missing", testCommit, "lil.yaml"); err == nil ||
-		!strings.Contains(err.Error(), "model must name") {
-		t.Fatalf("catalog entry without model: %v", err)
+	if err := load("Missing", missing); err == nil || !strings.Contains(err.Error(), "missing required key: model") {
+		t.Fatalf("entry without model: %v", err)
 	}
-	restated := "schema_version: 1\nkind: model\nmodel: a/b\nrevision: " + testCommit + "\ndescription: x\nserving: {served_model_name: x}\n"
-	if _, err := loadManifest(t, config.families, "Owned", restated); err == nil || !strings.Contains(err.Error(), "must not set model") {
-		t.Fatalf("repository manifest with model: %v", err)
+	badName := "schema_version: 1\nkind: model\nmodel: a/b\ndescription: x\nserving: {served_model_name: x}\n"
+	if _, err := LoadModelEntry(config.families, []byte(badName), "bad/name", testCommit, "lil.yaml", "local-inference-lab"); err == nil ||
+		!strings.Contains(err.Error(), "not a valid repository name") {
+		t.Fatalf("entry with invalid name: %v", err)
 	}
 }
 
