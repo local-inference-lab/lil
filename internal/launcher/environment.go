@@ -15,7 +15,7 @@ import (
 // or command-line options. Neither topology YAML, manifests, nor --env may set
 // them.
 var derivedEnvironment = stringSet(
-	"PYTHONPATH", "CUDA_HOME", "TRITON_PTXAS_PATH", "CUTE_DSL_ARCH",
+	"PYTHONPATH", "LD_LIBRARY_PATH", "CUDA_HOME", "TRITON_PTXAS_PATH", "CUTE_DSL_ARCH",
 	"CUDA_VISIBLE_DEVICES", "B12X_POLICY_MODE", "NCCL_DEBUG",
 	"NCCL_IB_GID_INDEX", "NCCL_IB_MERGE_NICS", "HF_HUB_OFFLINE",
 	"TRANSFORMERS_OFFLINE", "GLOO_SOCKET_IFNAME", "MN_IF_NAME", "NCCL_IB_HCA",
@@ -77,9 +77,13 @@ func DefaultSparkEnvironment() map[string]string {
 }
 
 func pythonPath(paths []string, inherit bool) string {
+	return searchPath("PYTHONPATH", paths, inherit)
+}
+
+func searchPath(variable string, paths []string, inherit bool) string {
 	entries := append([]string{}, paths...)
 	if inherit {
-		entries = append(entries, filepath.SplitList(os.Getenv("PYTHONPATH"))...)
+		entries = append(entries, filepath.SplitList(os.Getenv(variable))...)
 	}
 	seen := map[string]bool{}
 	unique := entries[:0]
@@ -94,14 +98,24 @@ func pythonPath(paths []string, inherit bool) string {
 
 // runtimeEnvironment layers, from lowest to highest precedence: topology host
 // tuning, launcher-derived values, resolved manifest environment, the PLE
-// command-line switch, and explicit --env overrides.
-func runtimeEnvironment(topology Topology, settings LaunchSettings, options LaunchOptions) (map[string]string, []string, error) {
+// command-line switch, and explicit --env overrides. needsNVRTC adds the
+// discovered NVRTC library directory for launches that run Humming kernels.
+func runtimeEnvironment(topology Topology, settings LaunchSettings, options LaunchOptions, needsNVRTC bool) (map[string]string, []string, error) {
 	environment := copyStringMap(topology.Environment())
 	runtimeRoots := []string{topology.RepoRoot(), topology.B12XRoot()}
 	if topology.Spark != nil {
 		runtimeRoots = []string{topology.Spark.RuntimeRepoRoot, topology.Spark.RuntimeB12XRoot}
 	}
 	environment["PYTHONPATH"] = pythonPath(runtimeRoots, topology.Local != nil)
+	if needsNVRTC {
+		if topology.NVRTCLibraryDir() == "" {
+			return nil, nil, fmt.Errorf(
+				"the Humming MoE backend needs the CUDA 13 NVRTC builtins, but topology %q recorded no nvrtc_library_dir; rediscover it",
+				topology.Name(),
+			)
+		}
+		environment["LD_LIBRARY_PATH"] = searchPath("LD_LIBRARY_PATH", []string{topology.NVRTCLibraryDir()}, topology.Local != nil)
+	}
 	environment["CUDA_HOME"] = topology.CUDAHome()
 	environment["TRITON_PTXAS_PATH"] = filepath.Join(topology.CUDAHome(), "bin", "ptxas")
 	environment["CUTE_DSL_ARCH"] = topology.CuteDSLArch()

@@ -95,6 +95,17 @@ for hca in hcas:
 print(json.dumps(sorted(common or [])))
 `
 
+// nvrtcProbe prints the directory holding the CUDA 13 NVRTC builtins that
+// the Humming MoE kernels load, or nothing when the venv does not ship them.
+const nvrtcProbe = `
+import os
+import sysconfig
+
+directory = os.path.join(sysconfig.get_path("purelib"), "nvidia", "cu13", "lib")
+if os.path.isfile(os.path.join(directory, "libnvrtc-builtins.so.13.0")):
+    print(directory)
+`
+
 type gpuObservation struct {
 	ID     int   `json:"id"`
 	Memory int64 `json:"memory"`
@@ -205,6 +216,17 @@ func runGPUProbe(ctx context.Context, python, directory string) ([]gpuObservatio
 		return nil, fmt.Errorf("GPU runtime probe failed: %s", lastOutputLine(output, "no output"))
 	}
 	return parseGPUObservations(output)
+}
+
+func discoverNVRTCLibraryDir(ctx context.Context, python, directory string) (string, error) {
+	output, status, err := runCommand(ctx, 30*time.Second, directory, nil, []string{python, "-c", nvrtcProbe})
+	if err != nil {
+		return "", err
+	}
+	if status != 0 {
+		return "", fmt.Errorf("NVRTC probe failed: %s", lastOutputLine(output, "no output"))
+	}
+	return strings.TrimSpace(string(output)), nil
 }
 
 func inferCUDAHome(explicit string) (string, error) {
@@ -362,6 +384,10 @@ func DiscoverLocalTopology(ctx context.Context, options LocalDiscoveryOptions) (
 	if err != nil {
 		return Topology{}, err
 	}
+	nvrtc, err := discoverNVRTCLibraryDir(ctx, python, repoRoot)
+	if err != nil {
+		return Topology{}, err
+	}
 	major, minor, err := commonComputeCapability(gpus)
 	if err != nil {
 		return Topology{}, err
@@ -385,7 +411,8 @@ func DiscoverLocalTopology(ctx context.Context, options LocalDiscoveryOptions) (
 			DeviceMemoryBytes: minimumGPUMemory(gpus),
 			RepoRoot:          repoRoot, Python: python, B12XRoot: b12xRoot,
 			CUDAHome: cudaHome, CuteDSLArch: cuteDSLArch(major, minor),
-			DevicePools: devicePools, Environment: DefaultLocalEnvironment(),
+			NVRTCLibraryDir: nvrtc,
+			DevicePools:     devicePools, Environment: DefaultLocalEnvironment(),
 		},
 	}, nil
 }
@@ -800,7 +827,13 @@ func DiscoverSparkTopology(ctx context.Context, options SparkDiscoveryOptions) (
 	}
 	networkObservations := map[string][]remoteNetworkObservation{}
 	allGPUs := []gpuObservation{}
+	nvrtcDirs := map[string]bool{}
 	for _, host := range options.Nodes {
+		nvrtcOutput, err := remoteOutput(ctx, host, []string{options.RuntimePython, "-c", nvrtcProbe}, 30*time.Second, "NVRTC probe")
+		if err != nil {
+			return Topology{}, err
+		}
+		nvrtcDirs[strings.TrimSpace(string(nvrtcOutput))] = true
 		for _, path := range remotePaths {
 			if err := remotePathCheck(ctx, host, path.path, path.mode); err != nil {
 				return Topology{}, err
@@ -867,6 +900,12 @@ func DiscoverSparkTopology(ctx context.Context, options SparkDiscoveryOptions) (
 			cacheMounts = append(cacheMounts, CacheMount{candidate.source, candidate.target})
 		}
 	}
+	nvrtc := ""
+	if len(nvrtcDirs) == 1 {
+		for directory := range nvrtcDirs {
+			nvrtc = directory
+		}
+	}
 	deviceMemory := minimumGPUMemory(allGPUs)
 	containerLimit := int64(options.ContainerMemoryGB) << 30
 	if containerLimit < deviceMemory {
@@ -900,6 +939,7 @@ func DiscoverSparkTopology(ctx context.Context, options SparkDiscoveryOptions) (
 			NCCLIBGIDIndex:        gidIndex,
 			NCCLIBMergeNICs:       mergeNICs,
 			DeviceID:              options.DeviceID,
+			NVRTCLibraryDir:       nvrtc,
 			Environment:           DefaultSparkEnvironment(),
 		},
 	}, nil

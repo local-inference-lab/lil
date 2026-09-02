@@ -34,6 +34,7 @@ var managedVLLMFlags = stringSet(
 	"--tensor-parallel-size", "--tool-call-parser", "--trust-remote-code",
 	"--device-ids", "--distributed-executor-backend", "--headless",
 	"--tokenizer-mode", "--scheduler-reserve-full-isl", "--enable-prompt-tokens-details",
+	"--prefill-schedule-interval",
 	"--enable-force-include-usage", "--enable-request-id-headers",
 	"--default-chat-template-kwargs", "--prefix-cache-retention-interval",
 	"--max-cudagraph-capture-size", "--cudagraph-capture-sizes",
@@ -221,7 +222,7 @@ func resolveDevices(topology Topology, options LaunchOptions, tpSize int) ([]int
 
 func defaultCapacityLayer() map[string]any {
 	return map[string]any{
-		"kv_cache_memory_bytes": nil, "max_model_len": "auto",
+		"gpu_memory_utilization": nil, "kv_cache_memory_bytes": nil, "max_model_len": "auto",
 		"max_num_seqs": 8, "max_num_batched_tokens": 4096,
 	}
 }
@@ -261,13 +262,22 @@ func resolveLaunchSettings(profile ModelProfile, topology Topology, tpSize int, 
 	return LaunchSettings{Capacity: parsed, CompilationConfig: compilation, Environment: environment}, applied, nil
 }
 
+// resolveUtilization picks the GPU memory utilization: the command line wins,
+// then a manifest capacity value, then the topology default.
+func resolveUtilization(settings LaunchSettings, topology Topology, options LaunchOptions) float64 {
+	if options.GPUMemoryUtilization != nil {
+		return *options.GPUMemoryUtilization
+	}
+	if settings.Capacity.GPUMemoryUtilization != nil {
+		return *settings.Capacity.GPUMemoryUtilization
+	}
+	return topology.MemoryUtilization()
+}
+
 func resolveCapacity(settings LaunchSettings, topology Topology, options LaunchOptions) Capacity {
 	capacity := settings.Capacity
-	utilization := topology.MemoryUtilization()
+	utilization := resolveUtilization(settings, topology, options)
 	capacity.GPUMemoryUtilization = &utilization
-	if options.GPUMemoryUtilization != nil {
-		capacity.GPUMemoryUtilization = options.GPUMemoryUtilization
-	}
 	if options.KVCacheMemoryBytes != nil {
 		if strings.EqualFold(*options.KVCacheMemoryBytes, "auto") {
 			capacity.KVCacheMemoryBytes = nil
@@ -293,7 +303,7 @@ func validateOptions(options LaunchOptions) error {
 			return err
 		}
 	}
-	if options.KVCacheDType == "" {
+	if options.KVCacheDType != nil && *options.KVCacheDType == "" {
 		return fmt.Errorf("KV cache dtype must not be empty")
 	}
 	if options.GPUMemoryUtilization != nil && (*options.GPUMemoryUtilization <= 0 || *options.GPUMemoryUtilization > 1) {
@@ -627,6 +637,7 @@ type argvInputs struct {
 	capacity        Capacity
 	settings        LaunchSettings
 	speculation     speculation
+	kvCacheDType    string
 }
 
 func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOptions, in argvInputs) ([]string, error) {
@@ -678,7 +689,7 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 		argv = append(argv, "--no-scheduler-reserve-full-isl")
 	}
 	appendOption(&argv, "--dtype", &kernels.DType)
-	appendOption(&argv, "--kv-cache-dtype", &options.KVCacheDType)
+	appendOption(&argv, "--kv-cache-dtype", &in.kvCacheDType)
 	appendOption(&argv, "--quantization", kernels.Quantization)
 	appendOption(&argv, "--attention-backend", kernels.Attention)
 	appendOption(&argv, "--block-size", intPointerString(kernels.BlockSize))
@@ -718,6 +729,7 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 		}
 	}
 	appendOption(&argv, "--long-prefill-token-threshold", intPointerString(serving.LongPrefillTokenThreshold))
+	appendOption(&argv, "--prefill-schedule-interval", intPointerString(serving.PrefillScheduleInterval))
 	if serving.ReasoningParser != "" {
 		appendOption(&argv, "--reasoning-parser", &serving.ReasoningParser)
 	}
@@ -981,11 +993,14 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 		}
 		facts = local
 	}
-	utilization := topology.MemoryUtilization()
-	if options.GPUMemoryUtilization != nil {
-		utilization = *options.GPUMemoryUtilization
+	fitUtilization := topology.MemoryUtilization()
+	if value, ok := profile.Base.Capacity["gpu_memory_utilization"].(float64); ok && value > 0 {
+		fitUtilization = value
 	}
-	tpSize, defaultTP, err := resolveTPSize(facts, topology, options.TPSize, utilization)
+	if options.GPUMemoryUtilization != nil {
+		fitUtilization = *options.GPUMemoryUtilization
+	}
+	tpSize, defaultTP, err := resolveTPSize(facts, topology, options.TPSize, fitUtilization)
 	if err != nil {
 		return LaunchSpec{}, err
 	}
@@ -1014,14 +1029,19 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 		return LaunchSpec{}, err
 	}
 	capacity := resolveCapacity(settings, topology, options)
-	environment, unsetEnvironment, err := runtimeEnvironment(topology, settings, options)
+	needsNVRTC := spec.Decision != nil && spec.Decision.Backend == "humming"
+	environment, unsetEnvironment, err := runtimeEnvironment(topology, settings, options, needsNVRTC)
 	if err != nil {
 		return LaunchSpec{}, err
+	}
+	kvCacheDType := profile.Kernels.KVCacheDType
+	if options.KVCacheDType != nil {
+		kvCacheDType = *options.KVCacheDType
 	}
 	vllmArgv, err := buildVLLMArgv(profile, topology, options, argvInputs{
 		tpSize: tpSize, deviceIDs: deviceIDs, modelSource: modelSource,
 		servedModelName: servedModelName, host: host, port: port,
-		capacity: capacity, settings: settings, speculation: spec,
+		capacity: capacity, settings: settings, speculation: spec, kvCacheDType: kvCacheDType,
 	})
 	if err != nil {
 		return LaunchSpec{}, err
@@ -1032,7 +1052,7 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 	}
 	metadata := map[string]any{
 		"capacity": capacity, "speculator": spec.Effective(), "speculative_tokens": spec.Tokens,
-		"kv_cache_dtype": options.KVCacheDType, "memory": memory,
+		"kv_cache_dtype": kvCacheDType, "memory": memory,
 		"manifest_commit": profile.ManifestCommit, "family": profile.Family,
 		"repository": profile.Model, "revision": profile.Revision,
 		"checkpoint_facts": factsMetadata(facts), "applied_overrides": appliedOverrides,

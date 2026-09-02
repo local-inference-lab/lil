@@ -13,6 +13,7 @@ serving:
     limit_per_prompt:
       image: 1
 kernels:
+  kv_cache_dtype: bfloat16
   quantization: modelopt_mixed
   block_size: 16
   gdn_decode: b12x
@@ -25,6 +26,9 @@ speculators:
   mtp:
     tokens: 3
     moe_quantization: nvfp4
+capacity:
+  gpu_memory_utilization: 0.94
+  max_num_seqs: 4
 compilation:
   cudagraph_mode: FULL_AND_PIECEWISE
   custom_ops:
@@ -36,7 +40,13 @@ overrides:
   - when:
       tp: 1
     capacity:
+      max_num_seqs: 1
+      max_model_len: "65536"
       max_num_batched_tokens: 2048
+      kv_cache_memory_bytes: "1610612736"
+    compilation:
+      pass_config:
+        fuse_act_quant: true
     environment:
       VLLM_PLE_CPU_OFFLOAD: "1"
       INSTANTTENSOR_BUFFER_SIZE: "1342177280"

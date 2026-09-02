@@ -11,6 +11,7 @@ serving:
 kernels:
   quantization: modelopt_mixed
   block_size: 256
+  mamba_cache_mode: align
   flashinfer_autotune: false
 speculators:
   default: mtp
@@ -20,7 +21,8 @@ speculators:
     attention: B12X
   dflash:
     tokens: 7
-    model: local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8
+    model: local-inference-lab/GLM-5.3-Flash-DFlash2
 environment:
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
   INSTANTTENSOR_BUFFER_SIZE: "67108864"
   INSTANTTENSOR_CHUNK_SIZE: "8388608"

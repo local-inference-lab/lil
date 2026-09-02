@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the lil project
 
-# Model families shared by several repositories. A manifest names one family;
-# a family may name a parent. Mappings merge, and scalars, lists, or explicit
-# nulls in the manifest replace the family value.
+# Model families shared by several catalog entries. An entry names one
+# family; a family may name a parent. Mappings merge, and scalars, lists, or
+# explicit nulls in the entry replace the family value.
 
 schema_version: 1
 
 families:
+  # GLM-5.3 checkpoints with NVFP4 routed experts served through B12X W4A16,
+  # the GLM 4.5 reasoning parser, and the GLM 4.7 tool parser. Recurrent
+  # cache settings belong to the Flash entries, whose architecture has GDN
+  # layers; the DSA architecture has none.
   glm:
     serving:
       reasoning_parser: glm45
       tool_call_parser: glm47
     kernels:
       attention: B12X
-      mamba_cache_mode: align
     environment:
-      VLLM_SSM_CONV_STATE_LAYOUT: DS
+      VLLM_B12X_MOE_FP4_FORCE_A16: "1"
 
   # DeepSeek V4 checkpoints on the SM120 PCIe stack: block-FP8 projections
   # with MXFP4 routed experts served through the B12X attention, linear, and

@@ -26,6 +26,7 @@ type LocalTopology struct {
 	B12XRoot          string
 	CUDAHome          string
 	CuteDSLArch       string
+	NVRTCLibraryDir   string
 	DevicePools       [][]int
 	Environment       map[string]string
 }
@@ -90,6 +91,7 @@ type SparkRDMATopology struct {
 	NCCLIBGIDIndex        int
 	NCCLIBMergeNICs       bool
 	DeviceID              int
+	NVRTCLibraryDir       string
 	Environment           map[string]string
 }
 
@@ -179,6 +181,15 @@ func (t Topology) Environment() map[string]string {
 	return t.Spark.Environment
 }
 
+// NVRTCLibraryDir is the directory holding the CUDA 13 NVRTC builtins that
+// the Humming MoE kernels load at runtime, or empty when discovery found none.
+func (t Topology) NVRTCLibraryDir() string {
+	if t.Local != nil {
+		return t.Local.NVRTCLibraryDir
+	}
+	return t.Spark.NVRTCLibraryDir
+}
+
 // MaxTPSize is the largest tensor-parallel size the topology can host.
 func (t Topology) MaxTPSize() int {
 	if t.Local != nil {
@@ -253,6 +264,7 @@ type ServingPolicy struct {
 	PrefixCacheRetentionInterval *int
 	ChunkedPrefill               bool
 	LongPrefillTokenThreshold    *int
+	PrefillScheduleInterval      *int
 	PromptTokensDetails          bool
 	ForceIncludeUsage            bool
 	RequestIDHeaders             bool
@@ -261,6 +273,7 @@ type ServingPolicy struct {
 
 type KernelPolicy struct {
 	DType              string
+	KVCacheDType       string
 	Quantization       *string
 	Attention          *string
 	Linear             string
@@ -360,7 +373,7 @@ type LaunchOptions struct {
 	Port                      *int
 	GPUMemoryUtilization      *float64
 	KVCacheMemoryBytes        *string
-	KVCacheDType              string
+	KVCacheDType              *string
 	MaxModelLen               *string
 	MaxNumSeqs                *int
 	MaxNumBatchedTokens       *int

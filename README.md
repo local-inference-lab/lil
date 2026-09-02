@@ -68,8 +68,14 @@ Every topology carries two policy fields that discovery fills with defaults:
   all-reduce policy on local hosts, loader buffer sizes and RDMA routing on
   Spark nodes. The block is required, so a topology written before it existed
   must be rediscovered or edited. Values the launcher derives from topology
-  facts, such as `CUDA_HOME`, `CUTE_DSL_ARCH`, `CUDA_VISIBLE_DEVICES`, and the
-  per-rank interface variables, cannot appear in it.
+  facts, such as `CUDA_HOME`, `CUTE_DSL_ARCH`, `CUDA_VISIBLE_DEVICES`,
+  `LD_LIBRARY_PATH`, and the per-rank interface variables, cannot appear in
+  it.
+
+Discovery also records `nvrtc_library_dir`, the venv directory holding the
+CUDA 13 NVRTC builtins, when the runtime Python ships them. Launches that
+select the Humming MoE backend put it on `LD_LIBRARY_PATH` and fail closed
+when it is absent.
 
 ## Run models
 
@@ -221,25 +227,31 @@ The sections:
   replaces the family value.
 - `serving` holds the API-facing policy: served name, remote code, tokenizer
   mode, parsers, tool choice, generation config, default chat-template
-  arguments, scheduler switches, prefix-cache retention, usage and request-ID
-  reporting, and multimodal limits. `auto_tool_choice` defaults to true when a
+  arguments, scheduler switches including the prefill schedule interval,
+  prefix-cache retention, usage and request-ID reporting, and multimodal
+  limits. `auto_tool_choice` defaults to true when a
   tool parser is set. Prefix caching and chunked prefill default to on. A
   manifest without parsers or a tool parser emits none of those flags.
-- `kernels` holds dtype, quantization, attention, linear, MoE, and GDN decode
-  backends, block size, Mamba cache mode, FlashInfer autotuning, and the weight
-  loader. Defaults are bfloat16, the B12X linear and MoE backends, and the
-  instanttensor loader.
+- `kernels` holds dtype, KV cache dtype, quantization, attention, linear, MoE,
+  and GDN decode backends, block size, Mamba cache mode, FlashInfer autotuning,
+  and the weight loader. Defaults are bfloat16 weights, an fp8 KV cache, the
+  B12X linear and MoE backends, and the instanttensor loader.
+  `--kv-cache-dtype` overrides the KV cache dtype for one launch.
 - `speculators` names a `default` of `mtp`, `dflash`, `dspark`, or `none`
   (the default) and a section per method. `mtp.moe_quantization` is an
   assertion checked against the checkpoint; it is required only when the
   checkpoint metadata cannot decide, and `mtp.moe_backend` overrides the
-  backend the quantization implies. NVFP4 and MXFP4 experts use the B12X
-  backend, MXFP8 and BF16 use Triton, and block-FP8 experts need an explicit
-  backend. A DSpark draft always ships inside the target checkpoint.
+  backend the quantization implies. NVFP4, MXFP4, and BF16 experts use the
+  B12X backend, MXFP8 experts use Triton, and block-FP8 experts need an
+  explicit backend. Declaring `humming` adds the topology's discovered NVRTC
+  library directory to the launch, which the Humming kernels load at runtime.
+  A DSpark draft always ships inside the target checkpoint.
 - `capacity`, `compilation`, and `environment` are the base launch layer.
   Capacity defaults are `max_model_len: auto`, eight sequences, and 4096
-  batched tokens. A compilation mapping enables `--compilation-config` with
-  computed CUDA graph capture sizes.
+  batched tokens; `capacity.gpu_memory_utilization` replaces the topology's
+  default for this model. Every capacity value is a default that the matching
+  command-line flag overrides. A compilation mapping enables
+  `--compilation-config` with computed CUDA graph capture sizes.
 - `overrides` is an ordered list of layers applied when every condition in
   `when` matches the launch. Conditions are `kind` (`local` or `spark_rdma`),
   `arch` (the topology's CuTe DSL architecture, such as `sm_121a`), `tp`, and
@@ -284,8 +296,9 @@ invalid types fail closed.
 A launch may use any tensor-parallel size the topology can host that divides
 the checkpoint's attention heads. Local launches take the first device pool
 large enough; Spark launches take the first N one-GPU ranks.
-`--kv-cache-dtype` defaults to `fp8`. The topology owns
-`--gpu-memory-utilization`, with `0.95` written by discovery unless overridden.
+The topology owns the default `--gpu-memory-utilization`, with `0.95` written
+by discovery; a catalog entry may replace it and the command line overrides
+both.
 
 CUDA graph capture sizes are calculated from resolved scheduler and speculation
 settings. The set contains mixed batch sizes and every uniform decode batch

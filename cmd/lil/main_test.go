@@ -43,13 +43,14 @@ func TestListShowsFactsAndPerTopologyDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.drafts) != 2 {
+	if len(loaded.drafts) != 1 {
 		t.Fatalf("draft entries: %v", loaded.drafts)
 	}
 	output := ansi.Strip(renderList(loaded.models))
 	for _, want := range []string{
-		"Models  7\n\n",
+		"Models  8\n\n",
 		"DeepSeek-V4-Flash-0731",
+		"148.6 GiB stored  ·  family deepseek-v4  ·  speculator mtp",
 		"155.4 GiB stored  ·  family deepseek-v4  ·  speculator dspark",
 		"GLM-5.3-NVFP4",
 		"GLM-5.3-NVFP4-Spark",

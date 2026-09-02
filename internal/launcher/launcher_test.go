@@ -24,6 +24,7 @@ const (
 	deepseekProfile       = "DeepSeek-V4-Flash-0731"
 	deepseekVisionProfile = "DeepSeek-V4-Flash-Vision-Exp"
 	deepseekRevision      = "9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
+	deepseekStandard      = "DeepSeek-V4-Flash"
 	testCommit            = "0123456789abcdef0123456789abcdef01234567"
 )
 
@@ -147,7 +148,6 @@ func stringPointerTest(value string) *string { return &value }
 
 func defaultOptions(tp int) LaunchOptions {
 	options := LaunchOptions{
-		KVCacheDType:   "fp8",
 		DCPSize:        1,
 		DCPCommBackend: "a2a",
 		AdaptiveWindow: 32,
@@ -193,7 +193,7 @@ func loadManifest(t *testing.T, families []byte, name, manifest string) (ModelPr
 func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 	config := loadTestConfig(t)
 	want := []string{
-		deepseekProfile, deepseekVisionProfile,
+		deepseekStandard, deepseekProfile, deepseekVisionProfile,
 		glmFlashProfile, glmFlashSparkProfile, glmProfile, glmSparkProfile,
 		qwenProfile,
 	}
@@ -249,11 +249,11 @@ serving:
 	if profile.Speculators.Default != "none" || profile.Kernels.Attention == nil || *profile.Kernels.Attention != "B12X" {
 		t.Fatalf("family defaults were not applied: %+v", profile)
 	}
-	if len(config.drafts) != 2 {
+	if len(config.drafts) != 1 {
 		t.Fatalf("draft entries: %+v", config.drafts)
 	}
-	draft := config.drafts["GLM-5.3-Flash-DFlash2-MXFP8"]
-	if draft.Model != "local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8" || draft.Method != "dflash" ||
+	draft := config.drafts["GLM-5.3-Flash-DFlash2"]
+	if draft.Model != "local-inference-lab/GLM-5.3-Flash-DFlash2" || draft.Method != "dflash" || draft.Quantization != "mxfp8" ||
 		!slices.Contains(draft.CompatibleModels, config.profiles[glmFlashProfile].Model) {
 		t.Fatalf("unexpected draft entry: %+v", draft)
 	}
@@ -279,9 +279,13 @@ func TestFamilyValuesMergeAndExplicitNullClears(t *testing.T) {
 	config := loadTestConfig(t)
 	glm := config.profiles[glmProfile]
 	if glm.Serving.ReasoningParser != "glm45" || glm.Serving.ToolCallParser != "glm47" ||
-		!glm.Serving.AutoToolChoice || glm.Base.Environment["VLLM_SSM_CONV_STATE_LAYOUT"] != "DS" ||
-		glm.Base.Environment["CUDA_DEVICE_MAX_CONNECTIONS"] != "32" {
+		!glm.Serving.AutoToolChoice || glm.Base.Environment["VLLM_B12X_MOE_FP4_FORCE_A16"] != "1" ||
+		glm.Base.Environment["CUDA_DEVICE_MAX_CONNECTIONS"] != "32" || glm.Kernels.MambaCacheMode != nil {
 		t.Fatalf("GLM family values were not merged: %+v", glm)
+	}
+	flash := config.profiles[glmFlashProfile]
+	if flash.Kernels.MambaCacheMode == nil || flash.Base.Environment["VLLM_SSM_CONV_STATE_LAYOUT"] != "DS" {
+		t.Fatalf("GLM Flash recurrent settings: %+v", flash)
 	}
 	profile, err := loadManifest(t, config.families, "Cleared", `schema_version: 1
 kind: model
@@ -342,6 +346,7 @@ func TestDefaultTPFollowsFitOrWholeCluster(t *testing.T) {
 		qwenProfile:           {2, 2},
 		deepseekProfile:       {2, 2},
 		deepseekVisionProfile: {2, 2},
+		deepseekStandard:      {2, 2},
 	} {
 		profile := config.profiles[name]
 		for _, item := range []struct {
@@ -439,7 +444,7 @@ func TestOverridesApplyByTPAndKind(t *testing.T) {
 		fused    bool
 		applied  []int
 	}{
-		{config.local, 1, "2048", "1", false, []int{0}},
+		{config.local, 1, "2048", "1", true, []int{0}},
 		{config.local, 2, "4096", "0", false, []int{}},
 		{config.spark, 1, "2048", "1", true, []int{0, 1}},
 		{config.spark, 2, "2048", "0", true, []int{1}},
@@ -468,8 +473,11 @@ func TestOverridesApplyByTPAndKind(t *testing.T) {
 		}
 	}
 	local1, _ := BuildLaunchSpec(qwen, config.local, defaultOptions(1))
-	if local1.RuntimeEnvironment["INSTANTTENSOR_BUFFER_SIZE"] != "1342177280" {
-		t.Fatalf("TP=1 loader tuning missing: %+v", local1.RuntimeEnvironment)
+	if local1.RuntimeEnvironment["INSTANTTENSOR_BUFFER_SIZE"] != "1342177280" ||
+		optionValue(t, local1.VLLMArgv, "--kv-cache-memory-bytes") != "1610612736" ||
+		optionValue(t, local1.VLLMArgv, "--max-model-len") != "65536" ||
+		optionValue(t, local1.VLLMArgv, "--max-num-seqs") != "1" {
+		t.Fatalf("TP=1 profile: %+v %v", local1.RuntimeEnvironment, local1.VLLMArgv)
 	}
 }
 
@@ -491,8 +499,10 @@ func TestEnvironmentLayersTopologyDerivedManifestAndCLI(t *testing.T) {
 		"CUTE_DSL_ARCH":               "sm_120a",
 		"B12X_POLICY_MODE":            "auto",
 		"VLLM_SSM_CONV_STATE_LAYOUT":  "DS",
+		"VLLM_B12X_MOE_FP4_FORCE_A16": "1",
 		"INSTANTTENSOR_BUFFER_SIZE":   "67108864",
 		"INSTANTTENSOR_CHUNK_SIZE":    "8388608",
+		"INSTANTTENSOR_IO_DEPTH":      "3",
 		"OMP_NUM_THREADS":             "8",
 		"MY_EXPERIMENT":               "1",
 	} {
@@ -590,9 +600,10 @@ func TestQwenMultimodalAndKernelContract(t *testing.T) {
 		"--model-loader-extra-config": `{"instanttensor_copy":false}`,
 		"--reasoning-parser":          "qwen3",
 		"--tool-call-parser":          "qwen3_xml",
-		"--max-model-len":             "auto",
-		"--max-num-seqs":              "8",
-		"--kv-cache-dtype":            "fp8",
+		"--max-model-len":             "65536",
+		"--max-num-seqs":              "1",
+		"--kv-cache-dtype":            "bfloat16",
+		"--gpu-memory-utilization":    "0.94",
 		"--quantization":              "modelopt_mixed",
 	} {
 		if got := optionValue(t, spec.VLLMArgv, flag); got != want {
@@ -685,7 +696,7 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 	}{
 		{"W4A16_NVFP4", "nvfp4", "b12x"},
 		{"MXFP8", "mxfp8", "triton"},
-		{"BF16", "bf16", "triton"},
+		{"BF16", "bf16", "b12x"},
 	}
 	for _, test := range tests {
 		t.Run(test.algorithm, func(t *testing.T) {
@@ -702,7 +713,7 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 	}
 	modelPath := writeCheckpoint(t, "", "TestArchitecture", 64)
 	decision, err := ResolveMTPMoEBackend(modelPath, "bfloat16")
-	if err != nil || decision.Quantization != "bf16" || decision.Backend != "triton" {
+	if err != nil || decision.Quantization != "bf16" || decision.Backend != "b12x" {
 		t.Fatalf("unquantized decision: %+v %v", decision, err)
 	}
 	if _, err := ResolveMTPMoEBackend(writeCheckpoint(t, "UNKNOWN_FP6", "TestArchitecture", 64), "bfloat16"); err == nil ||
@@ -714,13 +725,12 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 func TestMTPBackendDerivesFromRealConfigsAndMatchesManifestAssertions(t *testing.T) {
 	config := loadTestConfig(t)
 	for name, want := range map[string][2]string{
-		glmProfile:            {"bf16", "triton"},
-		glmSparkProfile:       {"nvfp4", "b12x"},
-		glmFlashProfile:       {"mxfp8", "triton"},
-		glmFlashSparkProfile:  {"nvfp4", "b12x"},
-		qwenProfile:           {"nvfp4", "b12x"},
-		deepseekProfile:       {"mxfp4", "b12x"},
-		deepseekVisionProfile: {"mxfp4", "b12x"},
+		glmProfile:           {"bf16", "b12x"},
+		glmSparkProfile:      {"nvfp4", "b12x"},
+		glmFlashProfile:      {"mxfp8", "triton"},
+		glmFlashSparkProfile: {"nvfp4", "b12x"},
+		qwenProfile:          {"nvfp4", "b12x"},
+		deepseekStandard:     {"mxfp4", "b12x"},
 	} {
 		options := defaultOptions(0)
 		options.Speculator = stringPointerTest("mtp")
@@ -768,8 +778,8 @@ func TestExplicitCheckpointMustAgreeWithRepositoryFacts(t *testing.T) {
 
 func TestKVCacheAndCapacityAreCLIOverrides(t *testing.T) {
 	config := loadTestConfig(t)
-	options := defaultOptions(2)
-	options.KVCacheDType = "bfloat16"
+	options := defaultOptions(4)
+	options.KVCacheDType = stringPointerTest("bfloat16")
 	options.GPUMemoryUtilization = floatPointer(0.87)
 	options.MaxModelLen = stringPointerTest("32768")
 	options.MaxNumSeqs = intPointer(17)
@@ -854,12 +864,12 @@ func TestCUDAGraphCaptureSizesKeepEveryMTPBatchShape(t *testing.T) {
 
 func TestMemoryEstimateUsesPostShardingWeightSize(t *testing.T) {
 	config := loadTestConfig(t)
-	spec, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, defaultOptions(2))
+	spec, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, defaultOptions(4))
 	if err != nil {
 		t.Fatal(err)
 	}
 	memory := spec.Metadata["memory"].(map[string]any)
-	if got := memory["estimated_sharded_weight_bytes_per_rank"]; got != int64(99021165756) {
+	if got := memory["estimated_sharded_weight_bytes_per_rank"]; got != int64(49510582878) {
 		t.Fatalf("estimated sharded bytes: got %v", got)
 	}
 	if memory["kv_cache_allocation"] != "vllm_runtime_profile" || memory["estimate_is_advisory"] != true ||
@@ -1010,7 +1020,7 @@ func TestHubLaunchDownloadsTargetAndDraftRepositories(t *testing.T) {
 	}
 	want := []RepositoryDownload{
 		{Repository: "local-inference-lab/GLM-5.3-Flash-NVFP4"},
-		{Repository: "local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8"},
+		{Repository: "local-inference-lab/GLM-5.3-Flash-DFlash2"},
 	}
 	if !reflect.DeepEqual(spec.Downloads, want) {
 		t.Fatalf("downloads: got %v, want %v", spec.Downloads, want)
@@ -1222,9 +1232,10 @@ func TestDeepSeekDSparkLaunchMatchesTheShellLauncher(t *testing.T) {
 		"--attention-backend":               "B12X",
 		"--moe-backend":                     "b12x",
 		"--linear-backend":                  "b12x",
-		"--max-num-seqs":                    "16",
-		"--max-num-batched-tokens":          "8192",
+		"--max-num-seqs":                    "8",
+		"--max-num-batched-tokens":          "4096",
 		"--max-model-len":                   "auto",
+		"--gpu-memory-utilization":          "0.975",
 		"--prefix-cache-retention-interval": "4096",
 	} {
 		if got := optionValue(t, argv, flag); got != want {
@@ -1248,7 +1259,7 @@ func TestDeepSeekDSparkLaunchMatchesTheShellLauncher(t *testing.T) {
 	}
 	speculative := speculativeConfigValue(t, spec)
 	if speculative["method"] != "dspark" || speculative["model"] != "deepseek-ai/DeepSeek-V4-Flash-0731" ||
-		speculative["revision"] != deepseekRevision || speculative["num_speculative_tokens"] != float64(7) ||
+		speculative["revision"] != deepseekRevision || speculative["num_speculative_tokens"] != float64(5) ||
 		speculative["draft_sample_method"] != "probabilistic" || speculative["rejection_sample_method"] != "standard" ||
 		speculative["enable_adaptive_verification"] != nil {
 		t.Fatalf("DSpark speculative config: %+v", speculative)
@@ -1258,7 +1269,7 @@ func TestDeepSeekDSparkLaunchMatchesTheShellLauncher(t *testing.T) {
 		t.Fatal(err)
 	}
 	sizes := compilation["cudagraph_capture_sizes"].([]any)
-	if sizes[len(sizes)-1] != float64(128) {
+	if sizes[len(sizes)-1] != float64(48) {
 		t.Fatalf("DSpark capture sizes must stop at max_num_seqs times K+1: %v", sizes)
 	}
 	for name, want := range map[string]string{
@@ -1286,9 +1297,8 @@ func TestDeepSeekOverridesFollowTheSpeculator(t *testing.T) {
 		lastSize   float64
 		hasSpec    bool
 	}{
-		{"dspark", "16", 128, true},
-		{"mtp", "64", 512, true},
-		{"none", "64", 128, false},
+		{"dspark", "8", 48, true},
+		{"none", "32", 64, false},
 	} {
 		options := defaultOptions(2)
 		options.Speculator = stringPointerTest(test.speculator)
@@ -1310,14 +1320,25 @@ func TestDeepSeekOverridesFollowTheSpeculator(t *testing.T) {
 		if slices.Contains(spec.VLLMArgv, "--speculative-config") != test.hasSpec {
 			t.Errorf("%s: speculative config presence %v", test.speculator, !test.hasSpec)
 		}
-		if test.speculator == "mtp" {
-			speculative := speculativeConfigValue(t, spec)
-			if speculative["moe_backend"] != "b12x" || speculative["revision"] != nil || speculative["rejection_sample_method"] != "standard" {
-				t.Errorf("MTP speculative config: %+v", speculative)
-			}
-		}
 	}
 	options := defaultOptions(2)
+	options.Speculator = stringPointerTest("mtp")
+	if _, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options); err == nil ||
+		!strings.Contains(err.Error(), "does not define an MTP speculator") {
+		t.Fatalf("MTP on the DSpark checkpoint must be refused: %v", err)
+	}
+	standard, err := BuildLaunchSpec(config.profiles[deepseekStandard], config.local, defaultOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	speculative := speculativeConfigValue(t, standard)
+	if speculative["method"] != "mtp" || speculative["num_speculative_tokens"] != float64(2) ||
+		speculative["moe_backend"] != "b12x" || speculative["revision"] != nil ||
+		optionValue(t, standard.VLLMArgv, "--max-num-seqs") != "64" ||
+		optionValue(t, standard.VLLMArgv, "--gpu-memory-utilization") != "0.91" {
+		t.Fatalf("standard checkpoint launch: %+v %v", speculative, standard.VLLMArgv)
+	}
+	options = defaultOptions(2)
 	options.AdaptiveVerification = true
 	spec, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options)
 	if err != nil {
@@ -1326,9 +1347,75 @@ func TestDeepSeekOverridesFollowTheSpeculator(t *testing.T) {
 	if speculativeConfigValue(t, spec)["enable_adaptive_verification"] != true {
 		t.Fatalf("adaptive verification switch was not applied")
 	}
-	options.Speculator = stringPointerTest("mtp")
-	if _, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options); err == nil || !strings.Contains(err.Error(), "only for DSpark") {
-		t.Fatalf("adaptive verification on MTP: %v", err)
+	options.Speculator = stringPointerTest("none")
+	if _, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options); err == nil || !strings.Contains(err.Error(), "DSpark") {
+		t.Fatalf("adaptive verification without DSpark: %v", err)
+	}
+}
+
+func TestHummingBackendNeedsTheDiscoveredNVRTCDirectory(t *testing.T) {
+	config := loadTestConfig(t)
+	profile := config.profiles[glmFlashProfile]
+	backend := "humming"
+	mtp := *profile.Speculators.MTP
+	mtp.MoEBackend = &backend
+	profile.Speculators.MTP = &mtp
+	spec, err := BuildLaunchSpec(profile, config.local, defaultOptions(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(spec.RuntimeEnvironment["LD_LIBRARY_PATH"], config.local.NVRTCLibraryDir()) ||
+		speculativeConfigValue(t, spec)["moe_backend"] != "humming" {
+		t.Fatalf("Humming launch environment: %+v", spec.RuntimeEnvironment)
+	}
+	bare := config.local
+	local := *bare.Local
+	local.NVRTCLibraryDir = ""
+	bare.Local = &local
+	if _, err := BuildLaunchSpec(profile, bare, defaultOptions(4)); err == nil || !strings.Contains(err.Error(), "nvrtc_library_dir") {
+		t.Fatalf("Humming without NVRTC directory: %v", err)
+	}
+	plain, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, defaultOptions(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, set := plain.RuntimeEnvironment["LD_LIBRARY_PATH"]; set {
+		t.Fatalf("Triton launch must not set LD_LIBRARY_PATH: %+v", plain.RuntimeEnvironment)
+	}
+	options := defaultOptions(4)
+	options.EnvironmentOverrides = []EnvironmentOverride{{"LD_LIBRARY_PATH", "/x"}}
+	if _, err := BuildLaunchSpec(profile, config.local, options); err == nil || !strings.Contains(err.Error(), "derived") {
+		t.Fatalf("LD_LIBRARY_PATH override: %v", err)
+	}
+}
+
+func TestManifestUtilizationAndPrefillIntervalAreEmitted(t *testing.T) {
+	config := loadTestConfig(t)
+	interval := 8
+	profile := config.profiles[glmFlashProfile]
+	profile.Serving.PrefillScheduleInterval = &interval
+	spec, err := BuildLaunchSpec(profile, config.local, defaultOptions(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if optionValue(t, spec.VLLMArgv, "--prefill-schedule-interval") != "8" {
+		t.Fatalf("prefill schedule interval: %v", spec.VLLMArgv)
+	}
+	qwen, err := BuildLaunchSpec(config.profiles[qwenProfile], config.local, defaultOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if optionValue(t, qwen.VLLMArgv, "--gpu-memory-utilization") != "0.94" {
+		t.Fatalf("manifest utilization: %v", qwen.VLLMArgv)
+	}
+	options := defaultOptions(2)
+	options.GPUMemoryUtilization = floatPointer(0.5)
+	qwen, err = BuildLaunchSpec(config.profiles[qwenProfile], config.local, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if optionValue(t, qwen.VLLMArgv, "--gpu-memory-utilization") != "0.5" {
+		t.Fatalf("CLI utilization must win: %v", qwen.VLLMArgv)
 	}
 }
 

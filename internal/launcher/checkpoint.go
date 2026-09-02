@@ -29,7 +29,7 @@ func MTPMoEBackendFromQuantization(quantization, evidence string) (MTPMoEBackend
 		"nvfp4": "b12x",
 		"mxfp4": "b12x",
 		"mxfp8": "triton",
-		"bf16":  "triton",
+		"bf16":  "b12x",
 	}[quantization]
 	if !ok {
 		return MTPMoEBackendDecision{Quantization: quantization, Evidence: []string{evidence}},
@@ -350,7 +350,7 @@ func unquantizedMTPDecision(config map[string]any, defaultDType string) (MTPMoEB
 			"cannot select an MTP MoE backend for unquantized checkpoint dtype %q", dtype,
 		)
 	}
-	return MTPMoEBackendDecision{"bf16", "triton", []string{fmt.Sprintf("no quantized MTP expert target; dtype=%v", dtype)}}, nil
+	return MTPMoEBackendFromQuantization("bf16", fmt.Sprintf("no quantized MTP expert target; dtype=%v", dtype))
 }
 
 // blockFP8CheckpointDecision handles checkpoints whose quantization_config

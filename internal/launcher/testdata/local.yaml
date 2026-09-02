@@ -14,6 +14,7 @@ python: .venv/bin/python
 b12x_root: /home/luke/projects/b12x
 cuda_home: /opt/cuda
 cute_dsl_arch: sm_120a
+nvrtc_library_dir: /home/luke/projects/vllm-hh-rebase/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
 device_pools:
   - [8, 9, 10, 11]
   - [0, 1, 2, 3, 4, 5, 6, 7]

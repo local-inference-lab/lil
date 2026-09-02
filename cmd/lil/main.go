@@ -78,7 +78,7 @@ func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bo
 	fs.IntVar(&values.port, "port", 0, "API port")
 	fs.Float64Var(&values.gpuMemoryUtilization, "gpu-memory-utilization", 0, "vLLM GPU memory utilization")
 	fs.StringVar(&values.kvCacheMemoryBytes, "kv-cache-memory-bytes", "", "explicit KV allocation or auto")
-	fs.StringVar(&values.kvCacheDType, "kv-cache-dtype", "fp8", "KV cache dtype")
+	fs.StringVar(&values.kvCacheDType, "kv-cache-dtype", "", "KV cache dtype (default: the manifest's kernels.kv_cache_dtype)")
 	fs.StringVar(&values.maxModelLen, "max-model-len", "", "maximum model length")
 	fs.IntVar(&values.maxNumSeqs, "max-num-seqs", 0, "maximum concurrent sequences")
 	fs.IntVar(&values.maxNumBatchedTokens, "max-num-batched-tokens", 0, "maximum batched tokens")
@@ -151,7 +151,7 @@ func (values launchFlags) options(fs *pflag.FlagSet, extraArgs []string) (launch
 		Port:                 pointerIfChanged(fs, "port", values.port),
 		GPUMemoryUtilization: pointerIfChanged(fs, "gpu-memory-utilization", values.gpuMemoryUtilization),
 		KVCacheMemoryBytes:   pointerIfChanged(fs, "kv-cache-memory-bytes", values.kvCacheMemoryBytes),
-		KVCacheDType:         values.kvCacheDType,
+		KVCacheDType:         pointerIfChanged(fs, "kv-cache-dtype", values.kvCacheDType),
 		MaxModelLen:          pointerIfChanged(fs, "max-model-len", values.maxModelLen),
 		MaxNumSeqs:           pointerIfChanged(fs, "max-num-seqs", values.maxNumSeqs),
 		MaxNumBatchedTokens:  pointerIfChanged(fs, "max-num-batched-tokens", values.maxNumBatchedTokens),

@@ -33,6 +33,7 @@ type localTopologyYAML struct {
 	B12XRoot             string            `yaml:"b12x_root"`
 	CUDAHome             string            `yaml:"cuda_home"`
 	CuteDSLArch          string            `yaml:"cute_dsl_arch"`
+	NVRTCLibraryDir      string            `yaml:"nvrtc_library_dir,omitempty"`
 	DevicePools          [][]int           `yaml:"device_pools"`
 	Environment          map[string]string `yaml:"environment"`
 }
@@ -81,6 +82,7 @@ type sparkTopologyYAML struct {
 	NCCLIBGIDIndex        int               `yaml:"nccl_ib_gid_index"`
 	NCCLIBMergeNICs       bool              `yaml:"nccl_ib_merge_nics"`
 	DeviceID              int               `yaml:"device_id"`
+	NVRTCLibraryDir       string            `yaml:"nvrtc_library_dir,omitempty"`
 	Environment           map[string]string `yaml:"environment"`
 }
 
@@ -131,6 +133,17 @@ func requiredAbsolutePath(path string) (string, error) {
 		return "", fmt.Errorf("must be an absolute path: %s", path)
 	}
 	return filepath.Clean(expanded), nil
+}
+
+func optionalAbsolutePath(path, context string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	resolved, err := requiredAbsolutePath(path)
+	if err != nil {
+		return "", fmt.Errorf("%s %w", context, err)
+	}
+	return resolved, nil
 }
 
 func nonEmpty(values ...string) bool {
@@ -238,6 +251,7 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 			B12XRoot:             local.B12XRoot,
 			CUDAHome:             local.CUDAHome,
 			CuteDSLArch:          local.CuteDSLArch,
+			NVRTCLibraryDir:      local.NVRTCLibraryDir,
 			DevicePools:          local.DevicePools,
 			Environment:          emptyIfNil(local.Environment),
 		}
@@ -291,6 +305,7 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 			NCCLIBGIDIndex:        spark.NCCLIBGIDIndex,
 			NCCLIBMergeNICs:       spark.NCCLIBMergeNICs,
 			DeviceID:              spark.DeviceID,
+			NVRTCLibraryDir:       spark.NVRTCLibraryDir,
 			Environment:           emptyIfNil(spark.Environment),
 		}
 	default:
@@ -399,13 +414,17 @@ func loadLocalTopology(data []byte, label, baseDir string) (Topology, error) {
 	if err != nil {
 		return Topology{}, err
 	}
+	nvrtc, err := optionalAbsolutePath(raw.NVRTCLibraryDir, label+".nvrtc_library_dir")
+	if err != nil {
+		return Topology{}, err
+	}
 	return Topology{
 		Kind: "local", GPUMemoryUtilization: utilization, DefaultTP: defaultTP,
 		Local: &LocalTopology{
 			Name: raw.Name, Host: raw.Host, Port: raw.Port,
 			DeviceMemoryBytes: raw.DeviceMemoryBytes,
 			RepoRoot:          repoRoot, Python: python, B12XRoot: b12xRoot,
-			CUDAHome: cudaHome, CuteDSLArch: raw.CuteDSLArch,
+			CUDAHome: cudaHome, CuteDSLArch: raw.CuteDSLArch, NVRTCLibraryDir: nvrtc,
 			DevicePools: raw.DevicePools, Environment: raw.Environment,
 		},
 	}, nil
@@ -537,6 +556,10 @@ func loadSparkTopology(data []byte, label, baseDir string) (Topology, error) {
 	if err != nil {
 		return Topology{}, err
 	}
+	nvrtc, err := optionalAbsolutePath(raw.NVRTCLibraryDir, label+".nvrtc_library_dir")
+	if err != nil {
+		return Topology{}, err
+	}
 	return Topology{
 		Kind: "spark_rdma", GPUMemoryUtilization: utilization, DefaultTP: defaultTP,
 		Spark: &SparkRDMATopology{
@@ -557,6 +580,7 @@ func loadSparkTopology(data []byte, label, baseDir string) (Topology, error) {
 			NCCLIBGIDIndex:  raw.NCCLIBGIDIndex,
 			NCCLIBMergeNICs: raw.NCCLIBMergeNICs,
 			DeviceID:        raw.DeviceID,
+			NVRTCLibraryDir: nvrtc,
 			Environment:     raw.Environment,
 		},
 	}, nil

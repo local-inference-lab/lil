@@ -9,24 +9,16 @@ serving:
 speculators:
   default: dspark
   dspark:
-    tokens: 7
+    tokens: 5
     model: target
     draft_sample_method: probabilistic
     rejection_sample_method: standard
-  mtp:
-    tokens: 3
-    moe_quantization: mxfp4
-    draft_sample_method: probabilistic
-    rejection_sample_method: standard
 capacity:
-  max_num_seqs: 16
-  max_num_batched_tokens: 8192
+  gpu_memory_utilization: 0.975
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
 overrides:
   - when:
       speculator: none
     capacity:
-      max_num_seqs: 64
-  - when:
-      speculator: mtp
-    capacity:
-      max_num_seqs: 64
+      max_num_seqs: 32

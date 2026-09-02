@@ -48,7 +48,8 @@ is qualified when:
 3. Generated arguments pass the target vLLM parser, on the controller for a
    local launch and inside the launch image for a Spark launch.
 4. Multimodal flags appear only for multimodal architectures.
-5. MTP expert selection resolves NVFP4 to B12X and MXFP8 or BF16 to Triton.
+5. MTP expert selection resolves NVFP4, MXFP4, and BF16 to B12X and MXFP8 to
+   Triton, or to the backend the entry declares.
 6. CUDA graph sizes cover all resolved MTP verification batches and the mixed
    batch ladder.
 7. A Hub-backed run updates every required repository in each selected rank's
@@ -61,26 +62,52 @@ existing family, the missing behavior belongs in the typed Go builder or a
 family. Copying a shell launcher into a large model-specific entry is
 unsupported.
 
+## Reference launchers
+
+Each entry's defaults follow a reference the lab maintains: the launch
+scripts at the root of the vLLM working tree (`serve-glm53.sh`,
+`serve-glm53-flash-nvfp4.sh`, `serve-qwen38-flash-next-nvfp4.sh` and its TP1
+variant, `serve-ds4-flash.sh`) and the qualified deployment pages in the
+`rtx6kpro` repository. Capacity values are defaults for the operator to
+override; the ones that encode memory fit, such as the GLM-5.3 Flash TP2
+KV allocation and the DSpark sequence count, are kept under the matching
+override condition.
+
+Two settings deliberately differ from a reference and are recorded here:
+
+- GLM-5.3 Flash serves MTP at depth 5 as its script does, while the
+  `rtx6kpro` R17 page qualifies depth 3.
+- The Qwen3.8 Flash Next entry enables async scheduling and full-graph
+  compilation, which its scripts do not, and uses the TP2 script's BF16 KV
+  cache at every TP where the TP1 script uses fp8.
+
+The MXFP8 MTP expert backend stays on Triton until Humming has been
+benchmarked against it; the GLM-5.3 Flash script selects Humming.
+
 ## DeepSeek V4 Flash
 
 The `deepseek-v4` family reproduces the SM120 PCIe policy of the
 `serve-ds4-flash.sh` launcher in the vLLM working tree: the `deepseek_v4`
 tokenizer and parsers, thinking enabled in the chat template, full-graph
 compilation, FlashInfer autotuning, the B12X attention backend, and the
-MegaMoE and multi-stream GEMM environment. Two catalog entries use it.
+MegaMoE and multi-stream GEMM environment. Three catalog entries use it.
 
 - `DeepSeek-V4-Flash-0731` is pinned to the release commit the shell launcher
-  pins. The DSpark draft head inside the checkpoint is the default speculator
-  at depth 7; `--speculator mtp` or `none` switch to the 64-sequence capacity
-  profile. Status: implemented, preflight-qualified against the installed
+  and the `rtx6kpro` r21 page pin. The DSpark draft head inside the checkpoint
+  is the default speculator at the qualified fixed depth 5, with eight
+  sequences and a 48-row graph envelope; `--speculator none` switches to the
+  32-sequence target-only profile. Standard MTP is not offered on this
+  checkpoint. Status: implemented, preflight-qualified against the installed
   parser, not yet served through `lil`.
-- `DeepSeek-V4-Flash-Vision-Exp` carries the same text policy pinned to its
-  first published commit. This vLLM tree registers no vision tower for the V4
+- `DeepSeek-V4-Flash` is the standard checkpoint with its MTP head at depth
+  2, the depth the lab's decode sweeps found best, at 64 sequences and 0.91
+  utilization. Status: implemented, preflight-qualified.
+- `DeepSeek-V4-Flash-Vision-Exp` carries the 0731 policy pinned to its first
+  published commit. This vLLM tree registers no vision tower for the V4
   architecture, so the entry serves the text model only and its vision weights
   are outside the launcher's contract. Status: research-only.
 
-The shell launcher raises GPU memory utilization to 0.975 for DSpark and
-serves a fixed 131072-token context; the catalog entries keep the topology's
-utilization and `max_model_len: auto`, so the runtime profile sizes the KV
-cache. Pass `--gpu-memory-utilization` and `--max-model-len` to reproduce the
-script's fixed profile.
+The entries keep `max_model_len: auto` so the runtime profile sizes the KV
+cache; the references fix 131072 or 1048576 tokens. The r21 page also serves
+FP8 dense projections through DeepGEMM by omitting the B12X linear backend;
+the entries follow the working tree's script and keep B12X.

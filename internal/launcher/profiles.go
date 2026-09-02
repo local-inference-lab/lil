@@ -20,15 +20,17 @@ var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Launcher-wide defaults that any manifest section may override.
 const (
-	defaultDType      = "bfloat16"
-	defaultLinear     = "b12x"
-	defaultMoE        = "b12x"
-	defaultLoadFormat = "instanttensor"
-	defaultMTPTokens  = 3
+	defaultDType        = "bfloat16"
+	defaultKVCacheDType = "fp8"
+	defaultLinear       = "b12x"
+	defaultMoE          = "b12x"
+	defaultLoadFormat   = "instanttensor"
+	defaultMTPTokens    = 3
 )
 
 var capacityKeys = []string{
-	"kv_cache_memory_bytes", "max_model_len", "max_num_seqs", "max_num_batched_tokens",
+	"gpu_memory_utilization", "kv_cache_memory_bytes", "max_model_len",
+	"max_num_seqs", "max_num_batched_tokens",
 }
 
 var speculatorMethods = stringSet("mtp", "dflash", "dspark", "none")
@@ -432,8 +434,24 @@ func parseCapacity(value any, context string) (Capacity, error) {
 	if err != nil {
 		return Capacity{}, err
 	}
-	if err := checkKeys(data, context, capacityKeys, nil); err != nil {
+	if err := checkKeys(data, context, capacityKeys[1:], capacityKeys[:1]); err != nil {
 		return Capacity{}, err
+	}
+	var utilization *float64
+	if data["gpu_memory_utilization"] != nil {
+		var value float64
+		switch typed := data["gpu_memory_utilization"].(type) {
+		case float64:
+			value = typed
+		case int:
+			value = float64(typed)
+		default:
+			return Capacity{}, fmt.Errorf("%s.gpu_memory_utilization must be a number or null", context)
+		}
+		if value <= 0 || value > 1 {
+			return Capacity{}, fmt.Errorf("%s.gpu_memory_utilization must be in (0, 1]", context)
+		}
+		utilization = &value
 	}
 	var kvCache *string
 	if data["kv_cache_memory_bytes"] != nil {
@@ -455,7 +473,7 @@ func parseCapacity(value any, context string) (Capacity, error) {
 	if !ok || maxTokens <= 0 {
 		return Capacity{}, fmt.Errorf("%s.max_num_batched_tokens must be a positive integer", context)
 	}
-	return Capacity{nil, kvCache, maxModelLen, maxSeqs, maxTokens}, nil
+	return Capacity{utilization, kvCache, maxModelLen, maxSeqs, maxTokens}, nil
 }
 
 func parseServing(data map[string]any, context string) (ServingPolicy, error) {
@@ -471,8 +489,8 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 		"auto_tool_choice", "generation_config", "hf_overrides", "chat_template_kwargs",
 		"async_scheduling", "scheduler_reserve_full_isl", "prefix_caching",
 		"prefix_cache_retention_interval", "chunked_prefill",
-		"long_prefill_token_threshold", "prompt_tokens_details", "force_include_usage",
-		"request_id_headers", "multimodal",
+		"long_prefill_token_threshold", "prefill_schedule_interval",
+		"prompt_tokens_details", "force_include_usage", "request_id_headers", "multimodal",
 	}); err != nil {
 		return ServingPolicy{}, err
 	}
@@ -535,6 +553,9 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 	if policy.LongPrefillTokenThreshold, err = s.optionalPositiveInt("long_prefill_token_threshold"); err != nil {
 		return policy, err
 	}
+	if policy.PrefillScheduleInterval, err = s.optionalPositiveInt("prefill_schedule_interval"); err != nil {
+		return policy, err
+	}
 	if policy.PromptTokensDetails, err = s.boolOr("prompt_tokens_details", false); err != nil {
 		return policy, err
 	}
@@ -582,21 +603,24 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 
 func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
 	policy := KernelPolicy{
-		DType: defaultDType, Linear: defaultLinear, MoE: defaultMoE,
-		LoadFormat: defaultLoadFormat,
+		DType: defaultDType, KVCacheDType: defaultKVCacheDType, Linear: defaultLinear,
+		MoE: defaultMoE, LoadFormat: defaultLoadFormat,
 	}
 	s, ok, err := subsection(data, "kernels", context)
 	if err != nil || !ok {
 		return policy, err
 	}
 	if err := checkKeys(s.data, s.context, nil, []string{
-		"dtype", "quantization", "attention", "linear", "moe", "gdn_decode",
+		"dtype", "kv_cache_dtype", "quantization", "attention", "linear", "moe", "gdn_decode",
 		"block_size", "mamba_cache_mode", "flashinfer_autotune", "load_format",
 		"loader_extra_config",
 	}); err != nil {
 		return policy, err
 	}
 	if policy.DType, err = s.stringOr("dtype", defaultDType); err != nil {
+		return policy, err
+	}
+	if policy.KVCacheDType, err = s.stringOr("kv_cache_dtype", defaultKVCacheDType); err != nil {
 		return policy, err
 	}
 	if policy.Quantization, err = s.optionalString("quantization"); err != nil {

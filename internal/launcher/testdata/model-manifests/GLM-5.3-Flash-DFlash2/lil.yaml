@@ -1,9 +1,9 @@
 schema_version: 1
 kind: draft
 model: local-inference-lab/GLM-5.3-Flash-DFlash2
-description: BF16 DFlash 2 speculative-decoding draft for GLM-5.3 Flash
+description: MXFP8 DFlash 2 speculative-decoding draft for GLM-5.3 Flash
 method: dflash
-quantization: bf16
+quantization: mxfp8
 compatible_models:
   - local-inference-lab/GLM-5.3-Flash-NVFP4
   - local-inference-lab/GLM-5.3-Flash-NVFP4-Spark
