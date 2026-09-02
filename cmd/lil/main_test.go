@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,9 +37,9 @@ func testModelsConfig() string {
 	)
 }
 
-func TestListUsesReadableMultilineCards(t *testing.T) {
+func TestListShowsFactsAndPerTopologyDefaults(t *testing.T) {
 	configureTestTopologies(t)
-	profiles, err := loadProfiles(testModelsConfig())
+	profiles, err := loadProfiles(context.Background(), testModelsConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,12 +49,15 @@ func TestListUsesReadableMultilineCards(t *testing.T) {
 		"GLM-5.3-NVFP4",
 		"GLM-5.3-NVFP4-Spark",
 		"GLM-5.3 with NVFP4 routed experts",
-		"defaults  ·  local TP 8  ·  Spark/RDMA TP all",
+		"432.9 GiB stored  ·  family glm  ·  speculator mtp",
+		"defaults  ·  local-test: TP 8  ·  spark-test: TP 2",
+		"98.6 GiB stored  ·  speculator mtp",
+		"defaults  ·  local-test: TP 2  ·  spark-test: TP 2",
 		"Topologies  2\n\n",
 		"local-test",
-		"local  ·  TP 1–12  ·  95.6 GiB/GPU  ·  sm_120a",
+		"local  ·  TP 1–12  ·  95.6 GiB/GPU  ·  sm_120a  ·  default TP fit",
 		"spark-test",
-		"Spark/RDMA  ·  TP 1–2  ·  108.0 GiB/rank  ·  sm_121a",
+		"Spark/RDMA  ·  TP 1–2  ·  108.0 GiB/rank  ·  sm_121a  ·  default TP all",
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("list output is missing %q:\n%s", want, output)
@@ -80,14 +84,14 @@ func TestForwardedArgumentsRequireSeparatorAndRemainLast(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	spec, err := buildSpec(fs, values)
+	spec, err := buildSpec(context.Background(), fs, values)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := spec.VLLMArgv[len(spec.VLLMArgv)-1]; got != "--disable-log-requests" {
 		t.Fatalf("last vLLM argument: got %q", got)
 	}
-	if !slices.Contains(spec.VLLMArgv, "--max-model-len") {
+	if !slices.Contains(spec.VLLMArgv, "--max-model-len") || spec.TPSize != 2 {
 		t.Fatalf("resolved argv is incomplete: %v", spec.VLLMArgv)
 	}
 }
@@ -106,7 +110,7 @@ func TestManagedForwardedArgumentFailsClosed(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := buildSpec(fs, values)
+	_, err := buildSpec(context.Background(), fs, values)
 	if err == nil || !strings.Contains(err.Error(), "launcher-managed") {
 		t.Fatalf("managed argument error: %v", err)
 	}
@@ -114,7 +118,7 @@ func TestManagedForwardedArgumentFailsClosed(t *testing.T) {
 
 func TestConfigurationErrorsReturnUsageStatus(t *testing.T) {
 	configureTestTopologies(t)
-	status, err := execute([]string{
+	status, err := execute(context.Background(), []string{
 		"render",
 		"Qwen3.8-Flash-Next-NVFP4",
 		"--models-config", testModelsConfig(),
@@ -124,9 +128,28 @@ func TestConfigurationErrorsReturnUsageStatus(t *testing.T) {
 		t.Fatalf("status=%d error=%v", status, err)
 	}
 
-	status, err = execute([]string{"list", "unexpected"})
+	status, err = execute(context.Background(), []string{"list", "unexpected"})
 	if status != 2 || err == nil {
 		t.Fatalf("list status=%d error=%v", status, err)
+	}
+}
+
+func TestRenderJSONUsesSparkTopologyByKind(t *testing.T) {
+	configureTestTopologies(t)
+	fs := newFlagSet("render")
+	var values launchFlags
+	configureLaunchFlags(fs, &values, false)
+	values.modelsConfig = testModelsConfig()
+	values.config = "spark"
+	if err := fs.Parse([]string{"GLM-5.3-Flash-NVFP4-Spark"}); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := buildSpec(context.Background(), fs, values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Topology.Spark == nil || spec.TPSize != 2 || len(spec.SparkNodes) != 2 {
+		t.Fatalf("unexpected Spark spec: %+v", spec)
 	}
 }
 
@@ -135,7 +158,7 @@ func TestClusterHelpReturnsSuccess(t *testing.T) {
 		{"cluster", "--help"},
 		{"cluster", "status", "--help"},
 	} {
-		status, err := execute(args)
+		status, err := execute(context.Background(), args)
 		if status != 0 || err != nil {
 			t.Errorf("%v: status=%d error=%v", args, status, err)
 		}

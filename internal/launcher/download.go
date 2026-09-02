@@ -4,6 +4,7 @@
 package launcher
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -56,15 +57,6 @@ func onlineEnvironment(spec LaunchSpec) []string {
 	return environment
 }
 
-func runVisible(argv []string, environment []string) error {
-	command := exec.Command(argv[0], argv[1:]...)
-	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if environment != nil {
-		command.Env = environment
-	}
-	return command.Run()
-}
-
 func warnUnmanagedDownload(repository, location string) {
 	fmt.Fprintf(
 		os.Stderr,
@@ -73,7 +65,7 @@ func warnUnmanagedDownload(repository, location string) {
 	)
 }
 
-func syncLocalHuggingFaceCache(spec LaunchSpec) error {
+func syncLocalHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
 	hf := localHFCLI(spec)
 	if hf == "" {
 		for _, repository := range spec.DownloadRepositories {
@@ -83,7 +75,7 @@ func syncLocalHuggingFaceCache(spec LaunchSpec) error {
 	}
 	for _, repository := range spec.DownloadRepositories {
 		fmt.Fprintf(os.Stderr, "updating Hugging Face cache for %s\n", repository)
-		if err := runVisible([]string{hf, "download", repository}, onlineEnvironment(spec)); err != nil {
+		if err := runVisible(ctx, []string{hf, "download", repository}, onlineEnvironment(spec)); err != nil {
 			return fmt.Errorf("Hugging Face download failed for %s: %w", repository, err)
 		}
 	}
@@ -114,7 +106,7 @@ func sparkHostHFArgv(
 	return append(argv, arguments...)
 }
 
-func remoteHFCLI(host string, topology *SparkRDMATopology) string {
+func remoteHFCLI(ctx context.Context, host string, topology *SparkRDMATopology) string {
 	candidates := []string{
 		filepath.Join(filepath.Dir(topology.RuntimePython), "hf"),
 		"hf",
@@ -124,7 +116,7 @@ func remoteHFCLI(host string, topology *SparkRDMATopology) string {
 		if argv == nil {
 			return ""
 		}
-		_, status, err := remoteRun(host, argv, 30*time.Second)
+		_, status, err := remoteRun(ctx, host, argv, 30*time.Second)
 		if err == nil && status == 0 {
 			return candidate
 		}
@@ -143,22 +135,22 @@ func sparkContainerHFArgv(topology *SparkRDMATopology, arguments ...string) []st
 	return append(argv, arguments...)
 }
 
-func sparkContainerHFIsAvailable(host string, topology *SparkRDMATopology) bool {
+func sparkContainerHFIsAvailable(ctx context.Context, host string, topology *SparkRDMATopology) bool {
 	if huggingFaceCacheMount(topology) == nil {
 		return false
 	}
 	argv := sparkContainerHFArgv(topology, "--version")
-	_, status, err := remoteRun(host, argv, 2*time.Minute)
+	_, status, err := remoteRun(ctx, host, argv, 2*time.Minute)
 	return err == nil && status == 0
 }
 
-func syncSparkHuggingFaceCache(spec LaunchSpec) error {
+func syncSparkHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
 	topology := spec.Topology.Spark
 	for _, node := range spec.SparkNodes {
-		hostHF := remoteHFCLI(node.Node.SSHHost, topology)
+		hostHF := remoteHFCLI(ctx, node.Node.SSHHost, topology)
 		useContainerHF := false
 		if hostHF == "" {
-			useContainerHF = sparkContainerHFIsAvailable(node.Node.SSHHost, topology)
+			useContainerHF = sparkContainerHFIsAvailable(ctx, node.Node.SSHHost, topology)
 		}
 		for _, repository := range spec.DownloadRepositories {
 			if hostHF == "" && !useContainerHF {
@@ -174,7 +166,7 @@ func syncSparkHuggingFaceCache(spec LaunchSpec) error {
 				argv = sparkContainerHFArgv(topology, "download", repository)
 			}
 			remote := RemoteArgv(node.Node.SSHHost, argv)
-			if err := runVisible(remote, nil); err != nil {
+			if err := runVisible(ctx, remote, nil); err != nil {
 				var exit *exec.ExitError
 				if errors.As(err, &exit) && exit.ExitCode() == 127 {
 					warnUnmanagedDownload(repository, "on "+node.Node.SSHHost)
@@ -192,12 +184,12 @@ func syncSparkHuggingFaceCache(spec LaunchSpec) error {
 
 // SyncHuggingFaceCache updates every unpinned Hub repository needed by a launch.
 // An unavailable hf CLI is non-fatal because vLLM can still populate its cache.
-func SyncHuggingFaceCache(spec LaunchSpec) error {
+func SyncHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
 	if len(spec.DownloadRepositories) == 0 {
 		return nil
 	}
 	if spec.Topology.Spark != nil {
-		return syncSparkHuggingFaceCache(spec)
+		return syncSparkHuggingFaceCache(ctx, spec)
 	}
-	return syncLocalHuggingFaceCache(spec)
+	return syncLocalHuggingFaceCache(ctx, spec)
 }

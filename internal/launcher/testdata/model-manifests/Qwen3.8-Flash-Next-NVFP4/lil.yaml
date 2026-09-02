@@ -1,59 +1,50 @@
 schema_version: 1
 kind: model
-extends:
-  - common
-  - full-graph
 description: Qwen3.8 Flash Next with NVFP4 routed experts and MTP, plus MXFP8 attention and shared experts
-weight_bytes: 105839538520
-served_model_name: Qwen3.8-Flash-Next
-expected_architectures:
-  - Qwen3_8FlashNextForConditionalGeneration
-  - Qwen4ExpForConditionalGeneration
-attention_heads: 24
-quantization: modelopt_mixed
-block_size: 16
-attention_backend: null
-reasoning_parser: qwen3
-tool_call_parser: qwen3_xml
-mamba_cache_mode: align
-async_scheduling: true
-disable_flashinfer_autotune: true
-gdn_decode_kernel: b12x
-model_loader_extra_config:
-  instanttensor_copy: false
-mm_encoder_tp_mode: data
-mm_processor_cache_gb: 0
-limit_mm_per_prompt:
-  image: 1
-default_speculator: mtp
-mtp_tokens: 3
-mtp_moe_quantization: nvfp4
-launch:
-  local:
-    default_tp_size: 2
-    defaults:
-      environment:
-        VLLM_PLE_CPU_OFFLOAD: "0"
-    tp:
-      1:
-        capacity:
-          max_num_batched_tokens: 2048
-        environment:
-          VLLM_PLE_CPU_OFFLOAD: "1"
-          INSTANTTENSOR_BUFFER_SIZE: "1342177280"
-          INSTANTTENSOR_CONCURRENCY: "1"
-          INSTANTTENSOR_IO_DEPTH: "3"
-  spark_rdma:
-    default_tp_size: all
-    defaults:
-      capacity:
-        max_num_batched_tokens: 2048
-      compilation_config:
-        pass_config:
-          fuse_act_quant: true
-      environment:
-        VLLM_PLE_CPU_OFFLOAD: "0"
-    tp:
-      1:
-        environment:
-          VLLM_PLE_CPU_OFFLOAD: "1"
+serving:
+  served_model_name: Qwen3.8-Flash-Next
+  reasoning_parser: qwen3
+  tool_call_parser: qwen3_xml
+  async_scheduling: true
+  multimodal:
+    encoder_tp_mode: data
+    processor_cache_gb: 0
+    limit_per_prompt:
+      image: 1
+kernels:
+  quantization: modelopt_mixed
+  block_size: 16
+  gdn_decode: b12x
+  mamba_cache_mode: align
+  flashinfer_autotune: false
+  loader_extra_config:
+    instanttensor_copy: false
+speculators:
+  default: mtp
+  mtp:
+    tokens: 3
+    moe_quantization: nvfp4
+compilation:
+  cudagraph_mode: FULL_AND_PIECEWISE
+  custom_ops:
+    - all
+environment:
+  VLLM_SSM_CONV_STATE_LAYOUT: DS
+  VLLM_PLE_CPU_OFFLOAD: "0"
+overrides:
+  - when:
+      tp: 1
+    capacity:
+      max_num_batched_tokens: 2048
+    environment:
+      VLLM_PLE_CPU_OFFLOAD: "1"
+      INSTANTTENSOR_BUFFER_SIZE: "1342177280"
+      INSTANTTENSOR_CONCURRENCY: "1"
+      INSTANTTENSOR_IO_DEPTH: "3"
+  - when:
+      kind: spark_rdma
+    capacity:
+      max_num_batched_tokens: 2048
+    compilation:
+      pass_config:
+        fuse_act_quant: true

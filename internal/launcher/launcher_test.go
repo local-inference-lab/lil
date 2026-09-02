@@ -4,6 +4,7 @@
 package launcher
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -20,12 +21,14 @@ const (
 	glmFlashSparkProfile = "GLM-5.3-Flash-NVFP4-Spark"
 	glmProfile           = "GLM-5.3-NVFP4"
 	glmSparkProfile      = "GLM-5.3-NVFP4-Spark"
+	testCommit           = "0123456789abcdef0123456789abcdef01234567"
 )
 
 type testConfig struct {
 	profiles map[string]ModelProfile
 	local    Topology
 	spark    Topology
+	families []byte
 }
 
 func loadTestConfig(t *testing.T) testConfig {
@@ -38,8 +41,7 @@ func loadTestConfig(t *testing.T) testConfig {
 		}
 		return data
 	}
-	basesPath := filepath.Join("..", "..", "configs", "models", "_bases.yaml")
-	bases, err := os.ReadFile(basesPath)
+	families, err := os.ReadFile(filepath.Join("..", "..", "configs", "models", "_bases.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,39 +55,42 @@ func loadTestConfig(t *testing.T) testConfig {
 		if !entry.IsDir() {
 			continue
 		}
-		path := filepath.Join(manifestRoot, entry.Name(), "lil.yaml")
-		data, err := os.ReadFile(path)
+		directory := filepath.Join(manifestRoot, entry.Name())
+		data, err := os.ReadFile(filepath.Join(directory, "lil.yaml"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		profile, err := LoadRepositoryModelProfile(
-			bases, data, "local-inference-lab/"+entry.Name(), "", path,
+			families, data, "local-inference-lab/"+entry.Name(), testCommit, directory+"/lil.yaml",
 		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile.Facts, err = LoadCheckpointFacts(directory)
 		if err != nil {
 			t.Fatal(err)
 		}
 		profiles[profile.Name] = profile
 	}
-	local, err := LoadTopology(
-		read("local.yaml"), "testdata/local.yaml", ".",
-	)
+	local, err := LoadTopology(read("local.yaml"), "testdata/local.yaml", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	spark, err := LoadTopology(
-		read("spark.yaml"), "testdata/spark.yaml", ".",
-	)
+	spark, err := LoadTopology(read("spark.yaml"), "testdata/spark.yaml", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return testConfig{profiles: profiles, local: local, spark: spark}
+	return testConfig{profiles: profiles, local: local, spark: spark, families: families}
 }
 
-func writeCheckpoint(t *testing.T, algorithm string, attentionHeads int) string {
+// writeCheckpoint creates a metadata-only checkpoint whose config.json names
+// the given architecture and head count and, optionally, an MTP expert
+// quantization.
+func writeCheckpoint(t *testing.T, algorithm, architecture string, attentionHeads int) string {
 	t.Helper()
 	modelPath := t.TempDir()
 	config := map[string]any{
-		"architectures": []string{"TestArchitecture"},
+		"architectures": []string{architecture},
 		"text_config": map[string]any{
 			"dtype":                    "bfloat16",
 			"num_attention_heads":      attentionHeads,
@@ -125,16 +130,18 @@ func intPointer(value int) *int              { return &value }
 func floatPointer(value float64) *float64    { return &value }
 func stringPointerTest(value string) *string { return &value }
 
-func defaultOptions(modelPath string, tp int) LaunchOptions {
-	return LaunchOptions{
-		TPSize:         intPointer(tp),
-		ModelPath:      stringPointerTest(modelPath),
+func defaultOptions(tp int) LaunchOptions {
+	options := LaunchOptions{
 		KVCacheDType:   "fp8",
 		DCPSize:        1,
 		DCPCommBackend: "a2a",
 		AdaptiveWindow: 32,
 		B12XPolicyMode: "auto",
 	}
+	if tp > 0 {
+		options.TPSize = intPointer(tp)
+	}
+	return options
 }
 
 func optionValue(t *testing.T, argv []string, name string) string {
@@ -160,6 +167,11 @@ func speculativeConfigValue(t *testing.T, spec LaunchSpec) map[string]any {
 	return value
 }
 
+func loadManifest(t *testing.T, families []byte, name, manifest string) (ModelProfile, error) {
+	t.Helper()
+	return LoadRepositoryModelProfile(families, []byte(manifest), "local-inference-lab/"+name, testCommit, name+"/lil.yaml")
+}
+
 func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 	config := loadTestConfig(t)
 	want := []string{
@@ -171,33 +183,49 @@ func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 	}
 	for name, profile := range config.profiles {
 		_, repository, ok := strings.Cut(profile.Model, "/")
-		if !ok || repository != name {
-			t.Errorf("profile %q has Hugging Face model %q", name, profile.Model)
+		if !ok || repository != name || profile.ManifestCommit != testCommit {
+			t.Errorf("profile %q has Hugging Face model %q commit %q", name, profile.Model, profile.ManifestCommit)
+		}
+	}
+}
+
+func TestCheckpointFactsComeFromTheCheckpointNotTheManifest(t *testing.T) {
+	config := loadTestConfig(t)
+	for name, want := range map[string]struct {
+		architecture string
+		heads        int
+		weightBytes  int64
+	}{
+		glmProfile:      {"GlmMoeDsaForCausalLM", 64, 464823066832},
+		glmFlashProfile: {"Glm5NextForConditionalGeneration", 64, 198042331512},
+		qwenProfile:     {"Qwen3_8FlashNextForConditionalGeneration", 24, 105839538520},
+	} {
+		facts := config.profiles[name].Facts
+		if facts == nil || facts.Architectures[0] != want.architecture ||
+			facts.AttentionHeads != want.heads || facts.WeightBytes != want.weightBytes {
+			t.Errorf("%s facts: %+v", name, facts)
 		}
 	}
 }
 
 func TestRepositoryManifestsInjectIdentityAndSeparateDrafts(t *testing.T) {
-	bases, err := os.ReadFile(filepath.Join("..", "..", "configs", "models", "_bases.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifest := []byte(`schema_version: 1
+	config := loadTestConfig(t)
+	profile, err := loadManifest(t, config.families, "Repository-Model", `schema_version: 1
 kind: model
-extends: glm
+family: glm
 description: Repository model
-served_model_name: served
-expected_architectures: [GlmMoeDsaForCausalLM]
+serving:
+  served_model_name: served
 `)
-	commit := "0123456789abcdef0123456789abcdef01234567"
-	profile, err := LoadRepositoryModelProfile(
-		bases, manifest, "local-inference-lab/Repository-Model", commit, "lil.yaml",
-	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.Name != "Repository-Model" || profile.Model != "local-inference-lab/Repository-Model" || profile.ManifestCommit != commit {
+	if profile.Name != "Repository-Model" || profile.Model != "local-inference-lab/Repository-Model" ||
+		profile.ManifestCommit != testCommit || profile.Family != "glm" {
 		t.Fatalf("repository identity was not injected: %+v", profile)
+	}
+	if profile.Speculators.Default != "none" || profile.Kernels.Attention == nil || *profile.Kernels.Attention != "B12X" {
+		t.Fatalf("family defaults were not applied: %+v", profile)
 	}
 
 	draftManifest := []byte(`schema_version: 1
@@ -209,7 +237,7 @@ compatible_models:
   - local-inference-lab/Repository-Model
 `)
 	draft, err := LoadRepositoryDraftProfile(
-		draftManifest, "local-inference-lab/Repository-Draft", commit, "lil.yaml",
+		draftManifest, "local-inference-lab/Repository-Draft", testCommit, "lil.yaml",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -218,50 +246,107 @@ compatible_models:
 		t.Fatalf("unexpected draft profile: %+v", draft)
 	}
 	if _, err := LoadRepositoryModelProfile(
-		bases, draftManifest, draft.RepositoryID, commit, "lil.yaml",
+		config.families, draftManifest, draft.RepositoryID, testCommit, "lil.yaml",
 	); err == nil || !strings.Contains(err.Error(), "kind must be model") {
 		t.Fatalf("draft accepted as serving model: %v", err)
 	}
 }
 
-func TestProfileInheritanceResolvesFamilyAndTPSettings(t *testing.T) {
+func TestFamilyValuesMergeAndExplicitNullClears(t *testing.T) {
 	config := loadTestConfig(t)
-	qwen := config.profiles[qwenProfile]
-	glm := config.profiles[glmFlashProfile]
-	qwenTP1 := qwen.Launch.Local.Resolve(1)
-	if qwenTP1.Capacity.MaxModelLen != "auto" ||
-		qwenTP1.Capacity.MaxNumSeqs != 8 ||
-		qwenTP1.Capacity.MaxNumBatchedTokens != 2048 ||
-		qwenTP1.Environment["VLLM_PLE_CPU_OFFLOAD"] != "1" {
-		t.Fatalf("unexpected inherited Qwen TP=1 settings: %+v", qwenTP1)
+	glm := config.profiles[glmProfile]
+	if glm.Serving.ReasoningParser != "glm45" || glm.Serving.ToolCallParser != "glm47" ||
+		!glm.Serving.AutoToolChoice || glm.Base.Environment["VLLM_SSM_CONV_STATE_LAYOUT"] != "DS" ||
+		glm.Base.Environment["CUDA_DEVICE_MAX_CONNECTIONS"] != "32" {
+		t.Fatalf("GLM family values were not merged: %+v", glm)
 	}
-	if glm.DType != "bfloat16" || glm.ReasoningParser != "glm45" ||
-		glm.Launch.SparkRDMA.Defaults.Capacity.MaxModelLen != "auto" {
-		t.Fatalf("unexpected inherited GLM settings: %+v", glm)
+	profile, err := loadManifest(t, config.families, "Cleared", `schema_version: 1
+kind: model
+family: glm
+description: Family with cleared attention backend
+serving:
+  served_model_name: cleared
+  tool_call_parser: null
+kernels:
+  attention: null
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.Kernels.Attention != nil || profile.Serving.ToolCallParser != "" || profile.Serving.AutoToolChoice {
+		t.Fatalf("explicit null did not clear family values: %+v", profile)
 	}
 }
 
-func TestProfileInheritanceAndStrictYAMLFailClosed(t *testing.T) {
-	cycle := []byte(`
-schema_version: 1
-bases:
-  first:
-    extends: second
-  second:
-    extends: first
-models:
-  broken:
-    extends: first
-`)
-	if _, err := LoadModelProfiles(cycle, "cycle.yaml"); err == nil ||
+func TestManifestSchemaFailsClosed(t *testing.T) {
+	config := loadTestConfig(t)
+	cases := map[string]struct {
+		manifest string
+		want     string
+	}{
+		"unknown key":                     {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nweight_bytes: 1\n", "unknown keys"},
+		"model restated":                  {"schema_version: 1\nkind: model\nmodel: a/b\ndescription: x\nserving: {served_model_name: x}\n", "must not set model"},
+		"unknown family":                  {"schema_version: 1\nkind: model\nfamily: nope\ndescription: x\nserving: {served_model_name: x}\n", "unknown model family"},
+		"mtp default without section":     {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nspeculators: {default: mtp}\n", "no mtp section"},
+		"auto tool choice without parser": {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x, auto_tool_choice: true}\n", "requires tool_call_parser"},
+		"derived environment":             {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nenvironment: {CUTE_DSL_ARCH: sm_90a}\n", "derived by the launcher"},
+		"unquoted environment value":      {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nenvironment: {VLLM_PLE_CPU_OFFLOAD: 1}\n", "quote"},
+		"override without condition":      {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\noverrides: [{when: {}, capacity: {max_num_seqs: 4}}]\n", "at least one condition"},
+		"bad capacity key":                {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\ncapacity: {max_seqs: 4}\n", "unknown keys"},
+		"bad moe quantization":            {"schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\nspeculators: {mtp: {moe_quantization: fp6}}\n", "moe_quantization"},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadManifest(t, config.families, "Broken", test.manifest)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error %v does not mention %q", err, test.want)
+			}
+		})
+	}
+	cycle := []byte("schema_version: 1\nfamilies:\n  first: {family: second}\n  second: {family: first}\n")
+	if _, err := loadManifest(t, cycle, "Cycle", "schema_version: 1\nkind: model\nfamily: first\ndescription: x\nserving: {served_model_name: x}\n"); err == nil ||
 		!strings.Contains(err.Error(), "inheritance cycle") {
 		t.Fatalf("cycle error: %v", err)
 	}
+}
 
-	data := []byte("schema_version: 1\nbases: {}\nunexpected: true\n")
-	if _, err := LoadModelProfiles(data, "invalid.yaml"); err == nil ||
-		!strings.Contains(err.Error(), "unknown keys") {
-		t.Fatalf("unknown-key error: %v", err)
+func TestDefaultTPFollowsFitOrWholeCluster(t *testing.T) {
+	config := loadTestConfig(t)
+	for name, want := range map[string]struct{ local, spark int }{
+		glmProfile:           {8, 2},
+		glmSparkProfile:      {8, 2},
+		glmFlashProfile:      {4, 2},
+		glmFlashSparkProfile: {4, 2},
+		qwenProfile:          {2, 2},
+	} {
+		profile := config.profiles[name]
+		for _, item := range []struct {
+			topology Topology
+			want     int
+		}{{config.local, want.local}, {config.spark, want.spark}} {
+			spec, err := BuildLaunchSpec(profile, item.topology, defaultOptions(0))
+			if err != nil {
+				t.Fatalf("%s on %s: %v", name, item.topology.Name(), err)
+			}
+			if spec.TPSize != item.want {
+				t.Errorf("%s on %s: default TP %d, want %d", name, item.topology.Name(), spec.TPSize, item.want)
+			}
+		}
+	}
+	huge := config.profiles[glmProfile]
+	facts := *huge.Facts
+	facts.WeightBytes = 4 << 40
+	huge.Facts = &facts
+	_, err := BuildLaunchSpec(huge, config.local, defaultOptions(0))
+	if err == nil || !strings.Contains(err.Error(), "do not fit") {
+		t.Fatalf("oversized checkpoint error: %v", err)
+	}
+	spec, err := BuildLaunchSpec(huge, config.local, defaultOptions(8))
+	if err != nil {
+		t.Fatalf("explicit TP must bypass the fit rule: %v", err)
+	}
+	if memory := spec.Metadata["memory"].(map[string]any); memory["fits"] != false {
+		t.Fatalf("memory estimate should report no headroom: %+v", memory)
 	}
 }
 
@@ -270,22 +355,18 @@ func TestEveryModelSupportsEveryValidLocalTP(t *testing.T) {
 	tests := []struct {
 		profile string
 		tp      []int
-		algo    string
 	}{
-		{qwenProfile, []int{1, 2, 3, 4, 6, 8, 12}, "W4A16_NVFP4"},
-		{glmFlashProfile, []int{1, 2, 4, 8}, "MXFP8"},
-		{glmFlashSparkProfile, []int{1, 2, 4, 8}, "W4A16_NVFP4"},
-		{glmProfile, []int{1, 2, 4, 8}, ""},
-		{glmSparkProfile, []int{1, 2, 4, 8}, "W4A16_NVFP4"},
+		{qwenProfile, []int{1, 2, 3, 4, 6, 8, 12}},
+		{glmFlashProfile, []int{1, 2, 4, 8}},
+		{glmFlashSparkProfile, []int{1, 2, 4, 8}},
+		{glmProfile, []int{1, 2, 4, 8}},
+		{glmSparkProfile, []int{1, 2, 4, 8}},
 	}
 	for _, test := range tests {
 		t.Run(test.profile, func(t *testing.T) {
 			profile := config.profiles[test.profile]
-			modelPath := writeCheckpoint(t, test.algo, profile.AttentionHeads)
 			for _, tp := range test.tp {
-				spec, err := BuildLaunchSpec(
-					profile, config.local, defaultOptions(modelPath, tp),
-				)
+				spec, err := BuildLaunchSpec(profile, config.local, defaultOptions(tp))
 				if err != nil {
 					t.Fatalf("TP=%d: %v", tp, err)
 				}
@@ -294,62 +375,213 @@ func TestEveryModelSupportsEveryValidLocalTP(t *testing.T) {
 					t.Fatalf("bad TP=%d launch: %+v", tp, spec)
 				}
 			}
+			supported := spec(t, profile, config.local).Metadata["tensor_parallel"].(map[string]any)["supported"].([]int)
+			if !reflect.DeepEqual(supported, test.tp) {
+				t.Fatalf("supported TP sizes: got %v, want %v", supported, test.tp)
+			}
 		})
 	}
 }
 
-func TestInvalidTPFailsBeforeLaunch(t *testing.T) {
-	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "W4A16_NVFP4", 24)
-	_, err := BuildLaunchSpec(
-		config.profiles[qwenProfile], config.local, defaultOptions(modelPath, 5),
-	)
-	if err == nil || !strings.Contains(err.Error(), "attention heads") {
-		t.Fatalf("invalid TP error: %v", err)
-	}
-}
-
-func TestCommonEnvironmentAndQwenMultimodalContract(t *testing.T) {
-	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "W4A16_NVFP4", 24)
-	spec, err := BuildLaunchSpec(
-		config.profiles[qwenProfile], config.local, defaultOptions(modelPath, 1),
-	)
+func spec(t *testing.T, profile ModelProfile, topology Topology) LaunchSpec {
+	t.Helper()
+	result, err := BuildLaunchSpec(profile, topology, defaultOptions(0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantEnvironment := map[string]string{
-		"CUDA_HOME":                   "/opt/cuda",
-		"TRITON_PTXAS_PATH":           "/opt/cuda/bin/ptxas",
-		"CUTE_DSL_ARCH":               "sm_120a",
-		"PYTORCH_CUDA_ALLOC_CONF":     "expandable_segments:True",
-		"B12X_POLICY_MODE":            "auto",
+	return result
+}
+
+func TestInvalidTPFailsBeforeLaunch(t *testing.T) {
+	config := loadTestConfig(t)
+	_, err := BuildLaunchSpec(config.profiles[qwenProfile], config.local, defaultOptions(5))
+	if err == nil || !strings.Contains(err.Error(), "attention heads") {
+		t.Fatalf("invalid TP error: %v", err)
+	}
+	_, err = BuildLaunchSpec(config.profiles[qwenProfile], config.spark, defaultOptions(3))
+	if err == nil || !strings.Contains(err.Error(), "one-GPU nodes") {
+		t.Fatalf("oversized Spark TP error: %v", err)
+	}
+}
+
+func TestOverridesApplyByTPAndKind(t *testing.T) {
+	config := loadTestConfig(t)
+	qwen := config.profiles[qwenProfile]
+	cases := []struct {
+		topology Topology
+		tp       int
+		tokens   string
+		ple      string
+		fused    bool
+		applied  []int
+	}{
+		{config.local, 1, "2048", "1", false, []int{0}},
+		{config.local, 2, "4096", "0", false, []int{}},
+		{config.spark, 1, "2048", "1", true, []int{0, 1}},
+		{config.spark, 2, "2048", "0", true, []int{1}},
+	}
+	for _, test := range cases {
+		spec, err := BuildLaunchSpec(qwen, test.topology, defaultOptions(test.tp))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := optionValue(t, spec.VLLMArgv, "--max-num-batched-tokens"); got != test.tokens {
+			t.Errorf("%s TP=%d batched tokens %s, want %s", test.topology.Name(), test.tp, got, test.tokens)
+		}
+		if got := spec.RuntimeEnvironment["VLLM_PLE_CPU_OFFLOAD"]; got != test.ple {
+			t.Errorf("%s TP=%d PLE %q, want %q", test.topology.Name(), test.tp, got, test.ple)
+		}
+		var compilation map[string]any
+		if err := json.Unmarshal([]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")), &compilation); err != nil {
+			t.Fatal(err)
+		}
+		_, fused := compilation["pass_config"]
+		if fused != test.fused {
+			t.Errorf("%s TP=%d fused pass config %v, want %v", test.topology.Name(), test.tp, fused, test.fused)
+		}
+		if got := spec.Metadata["applied_overrides"].([]int); !reflect.DeepEqual(got, test.applied) {
+			t.Errorf("%s TP=%d applied overrides %v, want %v", test.topology.Name(), test.tp, got, test.applied)
+		}
+	}
+	local1, _ := BuildLaunchSpec(qwen, config.local, defaultOptions(1))
+	if local1.RuntimeEnvironment["INSTANTTENSOR_BUFFER_SIZE"] != "1342177280" {
+		t.Fatalf("TP=1 loader tuning missing: %+v", local1.RuntimeEnvironment)
+	}
+}
+
+func TestEnvironmentLayersTopologyDerivedManifestAndCLI(t *testing.T) {
+	config := loadTestConfig(t)
+	options := defaultOptions(2)
+	options.EnvironmentOverrides = []EnvironmentOverride{{"OMP_NUM_THREADS", "8"}, {"MY_EXPERIMENT", "1"}}
+	spec, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{
+		"CUDA_DEVICE_ORDER":           "PCI_BUS_ID",
 		"NCCL_IB_DISABLE":             "1",
 		"VLLM_ENABLE_PCIE_ALLREDUCE":  "1",
 		"VLLM_PCIE_ALLREDUCE_BACKEND": "b12x",
-		"VLLM_PLE_CPU_OFFLOAD":        "1",
-	}
-	for name, want := range wantEnvironment {
+		"CUDA_HOME":                   "/opt/cuda",
+		"TRITON_PTXAS_PATH":           "/opt/cuda/bin/ptxas",
+		"CUTE_DSL_ARCH":               "sm_120a",
+		"B12X_POLICY_MODE":            "auto",
+		"VLLM_SSM_CONV_STATE_LAYOUT":  "DS",
+		"INSTANTTENSOR_BUFFER_SIZE":   "67108864",
+		"INSTANTTENSOR_CHUNK_SIZE":    "8388608",
+		"OMP_NUM_THREADS":             "8",
+		"MY_EXPERIMENT":               "1",
+	} {
 		if got := spec.RuntimeEnvironment[name]; got != want {
 			t.Errorf("%s: got %q, want %q", name, got, want)
 		}
 	}
-	for _, name := range []string{"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} {
+	if !strings.HasPrefix(spec.RuntimeEnvironment["PYTHONPATH"], "/home/luke/projects/vllm-hh-rebase:/home/luke/projects/b12x") {
+		t.Errorf("PYTHONPATH: %q", spec.RuntimeEnvironment["PYTHONPATH"])
+	}
+	for _, name := range []string{"CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} {
 		if !slices.Contains(spec.UnsetEnvironment, name) {
-			t.Errorf("%s is not cleared for online Hugging Face resolution", name)
+			t.Errorf("%s is not cleared", name)
 		}
 	}
-	if optionValue(t, spec.VLLMArgv, "--max-model-len") != "auto" ||
-		optionValue(t, spec.VLLMArgv, "--max-num-seqs") != "8" ||
-		optionValue(t, spec.VLLMArgv, "--kv-cache-dtype") != "fp8" {
-		t.Fatalf("unexpected capacity argv: %v", spec.VLLMArgv)
+	for _, name := range []string{"CUTE_DSL_ARCH", "CUDA_VISIBLE_DEVICES", "VLLM_HOST_IP"} {
+		options := defaultOptions(2)
+		options.EnvironmentOverrides = []EnvironmentOverride{{name, "x"}}
+		if _, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, options); err == nil ||
+			!strings.Contains(err.Error(), "derived") {
+			t.Errorf("--env %s was accepted: %v", name, err)
+		}
 	}
-	for _, flag := range []string{
-		"--mm-encoder-tp-mode", "--mm-processor-cache-gb", "--limit-mm-per-prompt",
+	options = defaultOptions(2)
+	options.PLECPUOffload = new(bool)
+	if _, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, options); err == nil ||
+		!strings.Contains(err.Error(), "VLLM_PLE_CPU_OFFLOAD") {
+		t.Fatalf("PLE switch on a model without PLE policy: %v", err)
+	}
+}
+
+func TestSparkEnvironmentUsesRecordedTuningAndDerivedRankValues(t *testing.T) {
+	config := loadTestConfig(t)
+	spec, err := BuildLaunchSpec(config.profiles[qwenProfile], config.spark, defaultOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{
+		"CUDA_VISIBLE_DEVICES":       "0",
+		"VLLM_ENABLE_PCIE_ALLREDUCE": "0",
+		"NCCL_IB_GID_INDEX":          "3",
+		"NCCL_IB_MERGE_NICS":         "1",
+		"NCCL_DEBUG":                 "INFO",
+		"NCCL_NET_PLUGIN":            "none",
+		"INSTANTTENSOR_BUFFER_SIZE":  "1342177280",
+		"PYTHONPATH":                 "/home/luke/projects/vllm:/home/luke/projects/b12x",
 	} {
-		if !slices.Contains(spec.VLLMArgv, flag) {
-			t.Errorf("Qwen multimodal argv is missing %s", flag)
+		if got := spec.RuntimeEnvironment[name]; got != want {
+			t.Errorf("%s: got %q, want %q", name, got, want)
 		}
+	}
+	rank1 := spec.SparkNodes[1].RuntimeEnvironment
+	if rank1["VLLM_HOST_IP"] != "10.200.0.2" || rank1["NCCL_IB_HCA"] != "rocep1s0f0,roceP2p1s0f0" ||
+		rank1["NCCL_SOCKET_IFNAME"] != "enp1s0f0np0" || rank1["NCCL_IB_DISABLE"] != "0" {
+		t.Fatalf("rank 1 environment: %+v", rank1)
+	}
+	if !slices.Contains(spec.VLLMArgv, "--disable-custom-all-reduce") {
+		t.Fatalf("Spark launch must disable custom all-reduce: %v", spec.VLLMArgv)
+	}
+}
+
+func TestTopologyRequiresEnvironmentBlock(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "local.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripped := string(data[:strings.Index(string(data), "environment:")])
+	if _, err := LoadTopology([]byte(stripped), "stripped.yaml", "."); err == nil ||
+		!strings.Contains(err.Error(), "environment is required") {
+		t.Fatalf("topology without environment: %v", err)
+	}
+	if _, err := LoadTopology([]byte(stripped+"environment:\n  CUTE_DSL_ARCH: sm_90a\n"), "derived.yaml", "."); err == nil ||
+		!strings.Contains(err.Error(), "derived") {
+		t.Fatalf("topology with derived variable: %v", err)
+	}
+	if _, err := LoadTopology([]byte(strings.Replace(string(data), "default_tp: fit", "default_tp: most", 1)), "policy.yaml", "."); err == nil ||
+		!strings.Contains(err.Error(), "default_tp") {
+		t.Fatalf("topology with bad default_tp: %v", err)
+	}
+}
+
+func TestQwenMultimodalAndKernelContract(t *testing.T) {
+	config := loadTestConfig(t)
+	spec, err := BuildLaunchSpec(config.profiles[qwenProfile], config.local, defaultOptions(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for flag, want := range map[string]string{
+		"--mm-encoder-tp-mode":        "data",
+		"--mm-processor-cache-gb":     "0",
+		"--limit-mm-per-prompt":       `{"image":1}`,
+		"--gdn-decode-kernel":         "b12x",
+		"--block-size":                "16",
+		"--mamba-cache-mode":          "align",
+		"--model-loader-extra-config": `{"instanttensor_copy":false}`,
+		"--reasoning-parser":          "qwen3",
+		"--tool-call-parser":          "qwen3_xml",
+		"--max-model-len":             "auto",
+		"--max-num-seqs":              "8",
+		"--kv-cache-dtype":            "fp8",
+		"--quantization":              "modelopt_mixed",
+	} {
+		if got := optionValue(t, spec.VLLMArgv, flag); got != want {
+			t.Errorf("%s: got %q, want %q", flag, got, want)
+		}
+	}
+	for _, flag := range []string{"--no-enable-flashinfer-autotune", "--enable-auto-tool-choice", "--async-scheduling", "--enable-prefix-caching", "--enable-chunked-prefill"} {
+		if !slices.Contains(spec.VLLMArgv, flag) {
+			t.Errorf("Qwen argv is missing %s", flag)
+		}
+	}
+	if slices.Contains(spec.VLLMArgv, "--attention-backend") {
+		t.Errorf("Qwen argv must not select an attention backend: %v", spec.VLLMArgv)
 	}
 	if got := speculativeConfigValue(t, spec)["moe_backend"]; got != "b12x" {
 		t.Fatalf("Qwen MTP backend: got %v, want b12x", got)
@@ -358,20 +590,66 @@ func TestCommonEnvironmentAndQwenMultimodalContract(t *testing.T) {
 
 func TestMultimodalOptionsAreProfileScoped(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "", 64)
-	spec, err := BuildLaunchSpec(
-		config.profiles[glmProfile], config.local,
-		defaultOptions(modelPath, 8),
-	)
+	spec, err := BuildLaunchSpec(config.profiles[glmProfile], config.local, defaultOptions(8))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, flag := range []string{
-		"--mm-encoder-tp-mode", "--mm-processor-cache-gb", "--limit-mm-per-prompt",
+		"--mm-encoder-tp-mode", "--mm-processor-cache-gb", "--limit-mm-per-prompt", "--hf-overrides",
 	} {
 		if slices.Contains(spec.VLLMArgv, flag) {
 			t.Errorf("GLM argv unexpectedly contains %s", flag)
 		}
+	}
+	if got := optionValue(t, spec.VLLMArgv, "--attention-backend"); got != "B12X" {
+		t.Errorf("GLM attention backend: %q", got)
+	}
+}
+
+func TestOptionalServingFlagsFollowTheManifest(t *testing.T) {
+	config := loadTestConfig(t)
+	profile, err := loadManifest(t, config.families, "Plain", `schema_version: 1
+kind: model
+description: Base model without tool calling or speculation
+serving:
+  served_model_name: plain
+  prefix_caching: false
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.Facts = config.profiles[glmProfile].Facts
+	spec, err := BuildLaunchSpec(profile, config.local, defaultOptions(8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{
+		"--reasoning-parser", "--tool-call-parser", "--enable-auto-tool-choice",
+		"--speculative-config", "--enable-prefix-caching", "--compilation-config",
+	} {
+		if slices.Contains(spec.VLLMArgv, flag) {
+			t.Errorf("plain argv unexpectedly contains %s", flag)
+		}
+	}
+	if !slices.Contains(spec.VLLMArgv, "--enable-chunked-prefill") || spec.Metadata["speculator"] != "none" {
+		t.Fatalf("plain launch defaults: %v %+v", spec.VLLMArgv, spec.Metadata)
+	}
+	options := defaultOptions(8)
+	options.Speculator = stringPointerTest("mtp")
+	if _, err := BuildLaunchSpec(profile, config.local, options); err == nil || !strings.Contains(err.Error(), "does not define an MTP speculator") {
+		t.Fatalf("MTP on a model without an MTP section: %v", err)
+	}
+}
+
+func TestRequiredArchitectureFailsClosed(t *testing.T) {
+	config := loadTestConfig(t)
+	profile := config.profiles[glmFlashSparkProfile]
+	profile.Requires = Requirements{Arch: []string{"sm_121a"}}
+	if _, err := BuildLaunchSpec(profile, config.local, defaultOptions(4)); err == nil || !strings.Contains(err.Error(), "requires sm_121a") {
+		t.Fatalf("requirement on local topology: %v", err)
+	}
+	if _, err := BuildLaunchSpec(profile, config.spark, defaultOptions(2)); err != nil {
+		t.Fatalf("requirement on Spark topology: %v", err)
 	}
 }
 
@@ -387,7 +665,7 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.algorithm, func(t *testing.T) {
-			modelPath := writeCheckpoint(t, test.algorithm, 64)
+			modelPath := writeCheckpoint(t, test.algorithm, "TestArchitecture", 64)
 			decision, err := ResolveMTPMoEBackend(modelPath, "bfloat16")
 			if err != nil {
 				t.Fatal(err)
@@ -398,35 +676,76 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 			}
 		})
 	}
+	modelPath := writeCheckpoint(t, "", "TestArchitecture", 64)
+	decision, err := ResolveMTPMoEBackend(modelPath, "bfloat16")
+	if err != nil || decision.Quantization != "bf16" || decision.Backend != "triton" {
+		t.Fatalf("unquantized decision: %+v %v", decision, err)
+	}
+	if _, err := ResolveMTPMoEBackend(writeCheckpoint(t, "UNKNOWN_FP6", "TestArchitecture", 64), "bfloat16"); err == nil ||
+		!strings.Contains(err.Error(), "cannot determine MTP") {
+		t.Fatalf("unknown quantization error: %v", err)
+	}
 }
 
-func TestUnquantizedBF16MTPUsesTriton(t *testing.T) {
-	modelPath := writeCheckpoint(t, "", 64)
-	decision, err := ResolveMTPMoEBackend(modelPath, "bfloat16")
+func TestMTPBackendDerivesFromRealConfigsAndMatchesManifestAssertions(t *testing.T) {
+	config := loadTestConfig(t)
+	for name, want := range map[string][2]string{
+		glmProfile:           {"bf16", "triton"},
+		glmSparkProfile:      {"nvfp4", "b12x"},
+		glmFlashProfile:      {"mxfp8", "triton"},
+		glmFlashSparkProfile: {"nvfp4", "b12x"},
+		qwenProfile:          {"nvfp4", "b12x"},
+	} {
+		spec, err := BuildLaunchSpec(config.profiles[name], config.local, defaultOptions(0))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		mtp := spec.Metadata["mtp_moe"].(map[string]any)
+		if mtp["quantization"] != want[0] || mtp["backend"] != want[1] {
+			t.Errorf("%s MTP decision: %+v", name, mtp)
+		}
+		if got := speculativeConfigValue(t, spec)["moe_backend"]; got != want[1] {
+			t.Errorf("%s speculative config backend %v", name, got)
+		}
+	}
+}
+
+func TestExplicitCheckpointMustAgreeWithRepositoryFacts(t *testing.T) {
+	config := loadTestConfig(t)
+	glmFlash := config.profiles[glmFlashProfile]
+	options := defaultOptions(2)
+	options.ModelPath = stringPointerTest(writeCheckpoint(t, "W4A16_NVFP4", "Glm5NextForConditionalGeneration", 64))
+	_, err := BuildLaunchSpec(glmFlash, config.local, options)
+	if err == nil || !strings.Contains(err.Error(), "MTP MoE quantization mismatch") {
+		t.Fatalf("manifest assertion mismatch: %v", err)
+	}
+	options.ModelPath = stringPointerTest(writeCheckpoint(t, "MXFP8", "OtherArchitecture", 64))
+	_, err = BuildLaunchSpec(glmFlash, config.local, options)
+	if err == nil || !strings.Contains(err.Error(), "declares") {
+		t.Fatalf("architecture mismatch: %v", err)
+	}
+	options.ModelPath = stringPointerTest(writeCheckpoint(t, "MXFP8", "Glm5NextForConditionalGeneration", 64))
+	spec, err := BuildLaunchSpec(glmFlash, config.local, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decision.Quantization != "bf16" || decision.Backend != "triton" {
-		t.Fatalf("decision: got %+v", decision)
+	if len(spec.DownloadRepositories) != 0 || spec.CheckpointPath == nil {
+		t.Fatalf("local checkpoint launch requested Hub downloads: %+v", spec.DownloadRepositories)
 	}
-}
-
-func TestUnknownMTPQuantizationFailsClosed(t *testing.T) {
-	modelPath := writeCheckpoint(t, "UNKNOWN_FP6", 64)
-	_, err := ResolveMTPMoEBackend(modelPath, "bfloat16")
-	if err == nil || !strings.Contains(err.Error(), "cannot determine MTP") {
-		t.Fatalf("unknown quantization error: %v", err)
+	memory := spec.Metadata["memory"].(map[string]any)
+	if got := memory["estimated_sharded_weight_bytes_per_rank"]; got != int64(24000000000) {
+		t.Fatalf("estimate must use the local checkpoint size: %v", got)
 	}
 }
 
 func TestKVCacheAndCapacityAreCLIOverrides(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "MXFP8", 64)
-	options := defaultOptions(modelPath, 2)
+	options := defaultOptions(2)
 	options.KVCacheDType = "bfloat16"
 	options.GPUMemoryUtilization = floatPointer(0.87)
 	options.MaxModelLen = stringPointerTest("32768")
 	options.MaxNumSeqs = intPointer(17)
+	options.KVCacheMemoryBytes = stringPointerTest("40000000000")
 	spec, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, options)
 	if err != nil {
 		t.Fatal(err)
@@ -436,27 +755,25 @@ func TestKVCacheAndCapacityAreCLIOverrides(t *testing.T) {
 		"--gpu-memory-utilization": "0.87",
 		"--max-model-len":          "32768",
 		"--max-num-seqs":           "17",
+		"--kv-cache-memory-bytes":  "40000000000",
 	} {
 		if got := optionValue(t, spec.VLLMArgv, flag); got != want {
 			t.Errorf("%s: got %q, want %q", flag, got, want)
 		}
 	}
+	if spec.Metadata["memory"].(map[string]any)["kv_cache_allocation"] != "explicit" {
+		t.Fatalf("explicit KV allocation not recorded: %+v", spec.Metadata["memory"])
+	}
 }
 
 func TestCUDAGraphCaptureSizesCoverMTPVerificationAndMixedShapes(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "", 64)
-	options := defaultOptions(modelPath, 8)
-	options.SpeculativeTokens = intPointer(3)
-	spec, err := BuildLaunchSpec(config.profiles[glmProfile], config.local, options)
+	spec, err := BuildLaunchSpec(config.profiles[glmProfile], config.local, defaultOptions(8))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var compilation map[string]any
-	if err := json.Unmarshal(
-		[]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")),
-		&compilation,
-	); err != nil {
+	if err := json.Unmarshal([]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")), &compilation); err != nil {
 		t.Fatal(err)
 	}
 	want := []any{
@@ -468,22 +785,21 @@ func TestCUDAGraphCaptureSizesCoverMTPVerificationAndMixedShapes(t *testing.T) {
 	if got := compilation["cudagraph_capture_sizes"]; !reflect.DeepEqual(got, want) {
 		t.Fatalf("capture sizes: got %v, want %v", got, want)
 	}
+	if compilation["cudagraph_mode"] != "FULL_AND_PIECEWISE" {
+		t.Fatalf("manifest compilation settings lost: %v", compilation)
+	}
 }
 
 func TestCUDAGraphCaptureSizesFollowSequenceCountsWithoutMTP(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "", 64)
-	options := defaultOptions(modelPath, 8)
+	options := defaultOptions(8)
 	options.Speculator = stringPointerTest("none")
 	spec, err := BuildLaunchSpec(config.profiles[glmProfile], config.local, options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var compilation map[string]any
-	if err := json.Unmarshal(
-		[]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")),
-		&compilation,
-	); err != nil {
+	if err := json.Unmarshal([]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")), &compilation); err != nil {
 		t.Fatal(err)
 	}
 	want := []any{
@@ -510,31 +826,23 @@ func TestCUDAGraphCaptureSizesKeepEveryMTPBatchShape(t *testing.T) {
 
 func TestMemoryEstimateUsesPostShardingWeightSize(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "MXFP8", 64)
-	spec, err := BuildLaunchSpec(
-		config.profiles[glmFlashProfile], config.local,
-		defaultOptions(modelPath, 2),
-	)
+	spec, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, defaultOptions(2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	memory := spec.Metadata["memory"].(map[string]any)
-	if got := memory["estimated_sharded_weight_bytes_per_rank"]; got != int64(24000000000) {
+	if got := memory["estimated_sharded_weight_bytes_per_rank"]; got != int64(99021165756) {
 		t.Fatalf("estimated sharded bytes: got %v", got)
 	}
-	if memory["kv_cache_allocation"] != "vllm_runtime_profile" ||
-		memory["estimate_is_advisory"] != true {
+	if memory["kv_cache_allocation"] != "vllm_runtime_profile" || memory["estimate_is_advisory"] != true ||
+		memory["estimate_source"] != "safetensors file sizes" && !strings.HasSuffix(memory["estimate_source"].(string), "model.safetensors.index.json") {
 		t.Fatalf("unexpected memory policy: %+v", memory)
 	}
 }
 
-func TestSparkSelectsFirstNNodesAndBuildsNativeDockerCommands(t *testing.T) {
+func TestSparkSelectsFirstNNodesAndBuildsPersistentNamedContainers(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "W4A16_NVFP4", 24)
-	spec, err := BuildLaunchSpec(
-		config.profiles[qwenProfile], config.spark,
-		defaultOptions(modelPath, 2),
-	)
+	spec, err := BuildLaunchSpec(config.profiles[qwenProfile], config.spark, defaultOptions(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,8 +853,16 @@ func TestSparkSelectsFirstNNodesAndBuildsNativeDockerCommands(t *testing.T) {
 		if node.Rank != rank || node.Node.SSHHost != []string{"tachyon", "luxon"}[rank] {
 			t.Errorf("rank %d node: %+v", rank, node.Node)
 		}
-		if !reflect.DeepEqual(node.DockerArgv[:2], []string{"docker", "run"}) {
-			t.Errorf("rank %d docker argv: %v", rank, node.DockerArgv)
+		if !reflect.DeepEqual(node.DockerArgv[:2], []string{"docker", "run"}) || slices.Contains(node.DockerArgv, "--rm") {
+			t.Errorf("rank %d docker argv must create a persistent container: %v", rank, node.DockerArgv)
+		}
+		if optionValue(t, node.DockerArgv, "--name") != "vllm-fleet-Qwen3.8-Flash-Next-NVFP4-tp2" || !slices.Contains(node.DockerArgv, "--detach") {
+			t.Errorf("rank %d container naming: %v", rank, node.DockerArgv)
+		}
+		for _, label := range []string{"lil.model=local-inference-lab/Qwen3.8-Flash-Next-NVFP4", "lil.tp=2", "lil.rank=" + strconv.Itoa(rank), "lil.manifest_commit=" + testCommit} {
+			if !slices.Contains(node.DockerArgv, label) {
+				t.Errorf("rank %d docker argv is missing label %s", rank, label)
+			}
 		}
 		if optionValue(t, node.VLLMArgv, "--nnodes") != "2" ||
 			optionValue(t, node.VLLMArgv, "--node-rank") != strconv.Itoa(rank) {
@@ -556,22 +872,11 @@ func TestSparkSelectsFirstNNodesAndBuildsNativeDockerCommands(t *testing.T) {
 			t.Errorf("rank %d headless mismatch", rank)
 		}
 	}
-	if spec.RuntimeEnvironment["CUDA_VISIBLE_DEVICES"] != "0" ||
-		spec.RuntimeEnvironment["VLLM_ENABLE_PCIE_ALLREDUCE"] != "0" ||
-		spec.RuntimeEnvironment["NCCL_IB_GID_INDEX"] != "3" ||
-		spec.RuntimeEnvironment["NCCL_IB_MERGE_NICS"] != "1" ||
-		!slices.Contains(spec.VLLMArgv, "--disable-custom-all-reduce") {
-		t.Fatalf("unexpected Spark runtime contract: %+v", spec)
-	}
 }
 
 func TestGLMFlashSparkPolicyMatchesRDMAContract(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "MXFP8", 64)
-	spec, err := BuildLaunchSpec(
-		config.profiles[glmFlashProfile], config.spark,
-		defaultOptions(modelPath, 2),
-	)
+	spec, err := BuildLaunchSpec(config.profiles[glmFlashSparkProfile], config.spark, defaultOptions(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,6 +885,7 @@ func TestGLMFlashSparkPolicyMatchesRDMAContract(t *testing.T) {
 		"--max-model-len":          "auto",
 		"--max-num-seqs":           "8",
 		"--max-num-batched-tokens": "4096",
+		"--tensor-parallel-size":   "2",
 	} {
 		if got := optionValue(t, spec.VLLMArgv, flag); got != want {
 			t.Errorf("%s: got %q, want %q", flag, got, want)
@@ -600,8 +906,7 @@ func TestGLMFlashSparkPolicyMatchesRDMAContract(t *testing.T) {
 
 func TestSparkProfilerUsesRemotePathAndMount(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "W4A16_NVFP4", 24)
-	options := defaultOptions(modelPath, 2)
+	options := defaultOptions(2)
 	options.Profiler = &ProfilerOptions{
 		OutputDir: "traces", WithStack: true, UseGzip: true, MaxIterations: 4,
 	}
@@ -621,7 +926,7 @@ func TestSparkProfilerUsesRemotePathAndMount(t *testing.T) {
 	}
 }
 
-func TestSparkTargetResolutionDoesNotInspectCheckpoint(t *testing.T) {
+func TestSparkTargetResolution(t *testing.T) {
 	config := loadTestConfig(t)
 	target, err := ResolveSparkTarget(config.profiles[qwenProfile], config.spark, intPointer(1), nil)
 	if err != nil {
@@ -631,11 +936,15 @@ func TestSparkTargetResolutionDoesNotInspectCheckpoint(t *testing.T) {
 		target.ContainerName != "vllm-fleet-Qwen3.8-Flash-Next-NVFP4-tp1" {
 		t.Fatalf("unexpected target: %+v", target)
 	}
+	target, err = ResolveSparkTarget(config.profiles[qwenProfile], config.spark, nil, nil)
+	if err != nil || target.TPSize != 2 {
+		t.Fatalf("default Spark target must span the cluster: %+v %v", target, err)
+	}
 }
 
 func TestSparkModelSyncRequiresExplicitModelPath(t *testing.T) {
 	config := loadTestConfig(t)
-	err := SyncSparkModel(LaunchSpec{
+	err := SyncSparkModel(context.Background(), LaunchSpec{
 		Topology:    config.spark,
 		ModelSource: "local-inference-lab/Qwen3.8-Flash-Next-NVFP4",
 	})
@@ -646,16 +955,15 @@ func TestSparkModelSyncRequiresExplicitModelPath(t *testing.T) {
 
 func TestManagedVLLMArgumentsCannotBeForwarded(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "W4A16_NVFP4", 24)
 	for _, arguments := range [][]string{
 		{"--port", "9000"},
 		{"--tensor_parallel_size=4"},
 		{"-tp", "4"},
 		{"--compilation-config.cudagraph-mode=NONE"},
 		{"--headless"},
-		{"--revision", "0123456789abcdef0123456789abcdef01234567"},
+		{"--revision", testCommit},
 	} {
-		options := defaultOptions(modelPath, 2)
+		options := defaultOptions(2)
 		options.ExtraVLLMArgs = arguments
 		_, err := BuildLaunchSpec(config.profiles[qwenProfile], config.local, options)
 		if err == nil || !strings.Contains(err.Error(), "launcher-managed") {
@@ -664,14 +972,11 @@ func TestManagedVLLMArgumentsCannotBeForwarded(t *testing.T) {
 	}
 }
 
-func TestHubLaunchDownloadsUnpinnedTargetAndDraftRepositories(t *testing.T) {
+func TestHubLaunchDownloadsTargetAndDraftRepositories(t *testing.T) {
 	config := loadTestConfig(t)
-	options := defaultOptions("", 2)
-	options.ModelPath = nil
-	options.Speculator = stringPointerTest("dflash2")
-	spec, err := BuildLaunchSpec(
-		config.profiles[glmFlashProfile], config.local, options,
-	)
+	options := defaultOptions(2)
+	options.Speculator = stringPointerTest("dflash")
+	spec, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -685,22 +990,12 @@ func TestHubLaunchDownloadsUnpinnedTargetAndDraftRepositories(t *testing.T) {
 	if slices.Contains(spec.VLLMArgv, "--revision") || spec.CheckpointPath != nil {
 		t.Fatalf("Hub launch is unexpectedly revision-bound: %+v", spec)
 	}
-	if config := speculativeConfigValue(t, spec); config["revision"] != nil {
-		t.Fatalf("DFlash configuration contains a revision: %+v", config)
+	speculative := speculativeConfigValue(t, spec)
+	if speculative["method"] != "dflash" || speculative["num_speculative_tokens"] != float64(7) || speculative["revision"] != nil {
+		t.Fatalf("DFlash configuration: %+v", speculative)
 	}
-}
-
-func TestExplicitModelPathSkipsTargetCacheDownload(t *testing.T) {
-	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "W4A16_NVFP4", 24)
-	spec, err := BuildLaunchSpec(
-		config.profiles[qwenProfile], config.local, defaultOptions(modelPath, 2),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(spec.DownloadRepositories) != 0 {
-		t.Fatalf("local checkpoint requested Hub downloads: %v", spec.DownloadRepositories)
+	if spec.Metadata["mtp_moe"] != nil {
+		t.Fatalf("DFlash launch carries an MTP decision: %+v", spec.Metadata)
 	}
 }
 
@@ -730,7 +1025,7 @@ printf '%s\n' "$*" > "$LIL_TEST_HF_LOG"
 		DownloadRepositories: []string{"local-inference-lab/Test-Model"},
 		UnsetEnvironment:     []string{"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"},
 	}
-	if err := SyncHuggingFaceCache(spec); err != nil {
+	if err := SyncHuggingFaceCache(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(logPath)
@@ -751,7 +1046,7 @@ func TestMissingHuggingFaceCLIDoesNotBlockLaunch(t *testing.T) {
 		}},
 		DownloadRepositories: []string{"local-inference-lab/Test-Model"},
 	}
-	if err := SyncHuggingFaceCache(spec); err != nil {
+	if err := SyncHuggingFaceCache(context.Background(), spec); err != nil {
 		t.Fatalf("missing hf CLI blocked launch: %v", err)
 	}
 }
@@ -772,7 +1067,7 @@ func TestHuggingFaceDownloadFailureBlocksLaunch(t *testing.T) {
 		}},
 		DownloadRepositories: []string{"local-inference-lab/Test-Model"},
 	}
-	err := SyncHuggingFaceCache(spec)
+	err := SyncHuggingFaceCache(context.Background(), spec)
 	if err == nil || !strings.Contains(err.Error(), "download failed") {
 		t.Fatalf("download failure was not propagated: %v", err)
 	}
@@ -786,9 +1081,7 @@ func TestSparkHuggingFaceCommandsUseRuntimeCLIAndPersistentCache(t *testing.T) {
 			Source: "/srv/cache/huggingface", Target: "/root/.cache/huggingface",
 		}},
 	}
-	host := sparkHostHFArgv(
-		topology, "/opt/vllm/.venv/bin/hf", "download", "org/model",
-	)
+	host := sparkHostHFArgv(topology, "/opt/vllm/.venv/bin/hf", "download", "org/model")
 	for _, want := range []string{
 		"HF_HOME=/srv/cache/huggingface", "/opt/vllm/.venv/bin/hf",
 		"download", "org/model",
@@ -810,11 +1103,7 @@ func TestSparkHuggingFaceCommandsUseRuntimeCLIAndPersistentCache(t *testing.T) {
 
 func TestShellAndJSONRenderExposeResolvedCommand(t *testing.T) {
 	config := loadTestConfig(t)
-	modelPath := writeCheckpoint(t, "", 64)
-	spec, err := BuildLaunchSpec(
-		config.profiles[glmProfile], config.local,
-		defaultOptions(modelPath, 8),
-	)
+	spec, err := BuildLaunchSpec(config.profiles[glmProfile], config.local, defaultOptions(8))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,8 +1120,21 @@ func TestShellAndJSONRenderExposeResolvedCommand(t *testing.T) {
 	if err := json.Unmarshal(encoded, &rendered); err != nil {
 		t.Fatal(err)
 	}
-	if rendered["model"] != glmProfile || rendered["topology_kind"] != "local" ||
-		rendered["tensor_parallel_size"] != float64(8) {
-		t.Fatalf("unexpected JSON render: %s", encoded)
+	if rendered["model"] != glmProfile || rendered["manifest_commit"] != testCommit || rendered["family"] != "glm" ||
+		rendered["tensor_parallel_size"] != float64(8) || rendered["topology_kind"] != "local" {
+		t.Fatalf("unexpected JSON render: %v", rendered)
+	}
+	metadata := rendered["metadata"].(map[string]any)
+	facts := metadata["checkpoint_facts"].(map[string]any)
+	if facts["attention_heads"] != float64(64) || facts["weight_bytes"] != float64(464823066832) {
+		t.Fatalf("checkpoint facts missing from JSON: %v", facts)
+	}
+	sparkSpec, err := BuildLaunchSpec(config.profiles[glmFlashSparkProfile], config.spark, defaultOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sparkShell := ShellRender(sparkSpec)
+	if !strings.Contains(sparkShell, "ServerAliveInterval=15") || strings.Count(sparkShell, "ssh ") != 2 {
+		t.Fatalf("unexpected Spark shell render:\n%s", sparkShell)
 	}
 }

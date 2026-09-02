@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ type discoveryFlags struct {
 	host                  string
 	port                  int
 	gpuMemoryUtilization  float64
+	defaultTP             string
 	repoRoot              string
 	python                string
 	b12xRoot              string
@@ -49,6 +51,7 @@ func configureDiscoveryFlags(fs *pflag.FlagSet, values *discoveryFlags) {
 	fs.StringVar(&values.host, "host", "0.0.0.0", "API bind address")
 	fs.IntVar(&values.port, "port", 8000, "API port")
 	fs.Float64Var(&values.gpuMemoryUtilization, "gpu-memory-utilization", launcher.DefaultGPUMemoryUtilization, "default vLLM GPU memory utilization")
+	fs.StringVar(&values.defaultTP, "default-tp", "", "default tensor-parallel policy: fit (local default) or all (Spark default)")
 	fs.StringVar(&values.repoRoot, "repo-root", "", "controller vLLM source root")
 	fs.StringVar(&values.python, "python", "", "controller vLLM Python executable")
 	fs.StringVar(&values.b12xRoot, "b12x-root", "", "controller B12X source root")
@@ -116,7 +119,7 @@ func writeTopology(path string, data []byte, force bool) error {
 	return nil
 }
 
-func discoverCommand(args []string) error {
+func discoverCommand(ctx context.Context, args []string) error {
 	fs := pflag.NewFlagSet("discover", pflag.ContinueOnError)
 	fs.SetInterspersed(true)
 	fs.SetOutput(os.Stderr)
@@ -147,17 +150,17 @@ func discoverCommand(args []string) error {
 		if len(values.nodes) != 0 {
 			return fmt.Errorf("--node is valid only for Spark/RDMA discovery")
 		}
-		topology, err = launcher.DiscoverLocalTopology(launcher.LocalDiscoveryOptions{
+		topology, err = launcher.DiscoverLocalTopology(ctx, launcher.LocalDiscoveryOptions{
 			Name: values.name, Host: values.host, Port: values.port,
-			GPUMemoryUtilization: values.gpuMemoryUtilization,
-			RepoRoot:             values.repoRoot, Python: values.python,
+			GPUMemoryUtilization: values.gpuMemoryUtilization, DefaultTP: values.defaultTP,
+			RepoRoot: values.repoRoot, Python: values.python,
 			B12XRoot: values.b12xRoot, CUDAHome: values.cudaHome,
 		})
 	} else {
-		topology, err = launcher.DiscoverSparkTopology(launcher.SparkDiscoveryOptions{
+		topology, err = launcher.DiscoverSparkTopology(ctx, launcher.SparkDiscoveryOptions{
 			Name: values.name, Host: values.host, Port: values.port,
-			GPUMemoryUtilization: values.gpuMemoryUtilization,
-			RepoRoot:             values.repoRoot, Python: values.python,
+			GPUMemoryUtilization: values.gpuMemoryUtilization, DefaultTP: values.defaultTP,
+			RepoRoot: values.repoRoot, Python: values.python,
 			B12XRoot: values.b12xRoot, RuntimeRepoRoot: values.runtimeRepoRoot,
 			RuntimePython: values.runtimePython, VLLMBin: values.vllmBin,
 			RuntimeB12XRoot: values.runtimeB12XRoot, Nodes: values.nodes,

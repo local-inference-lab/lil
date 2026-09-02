@@ -1,43 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the lil project
 
+# Model families shared by several repositories. A manifest names one family;
+# a family may name a parent. Mappings merge, and scalars, lists, or explicit
+# nulls in the manifest replace the family value.
+
 schema_version: 1
 
-bases:
-  common:
-    launch:
-      defaults:
-        capacity:
-          kv_cache_memory_bytes: null
-          max_model_len: auto
-          max_num_seqs: 8
-          max_num_batched_tokens: 4096
-        compilation_config: null
-        environment: {}
-      local:
-        default_tp_size: 2
-      spark_rdma:
-        default_tp_size: all
-    dtype: bfloat16
-    linear_backend: b12x
-    moe_backend: b12x
-    load_format: instanttensor
-
-  full-graph:
-    launch:
-      defaults:
-        compilation_config:
-          cudagraph_mode: FULL_AND_PIECEWISE
-          custom_ops:
-            - all
-
+families:
   glm:
-    extends: common
-    expected_architectures:
-      - Glm5NextForConditionalGeneration
-      - GlmMoeDsaForCausalLM
-    attention_heads: 64
-    attention_backend: B12X
-    reasoning_parser: glm45
-    tool_call_parser: glm47
-    mamba_cache_mode: align
+    serving:
+      reasoning_parser: glm45
+      tool_call_parser: glm47
+    kernels:
+      attention: B12X
+      mamba_cache_mode: align
+    environment:
+      VLLM_SSM_CONV_STATE_LAYOUT: DS

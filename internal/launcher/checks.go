@@ -50,6 +50,7 @@ from pathlib import Path
 
 config = json.loads(sys.argv[1])
 errors = []
+notes = []
 
 for path, kind in config["paths"]:
     candidate = Path(path)
@@ -71,13 +72,13 @@ else:
     if config["address"] not in address.stdout:
         errors.append(f"{interface} does not own {config['address']}")
 
-if config["peer_address"] is not None:
-    peer = subprocess.run(
-        ["ping", "-c", "1", "-W", "2", config["peer_address"]],
+for peer in config["peer_addresses"]:
+    reply = subprocess.run(
+        ["ping", "-c", "1", "-W", "2", peer],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    if peer.returncode:
-        errors.append(f"cannot reach RDMA peer address: {config['peer_address']}")
+    if reply.returncode:
+        errors.append(f"cannot reach RDMA peer address: {peer}")
 
 rdma = subprocess.run(["rdma", "link", "show"], check=False, capture_output=True, text=True)
 for hca in config["rdma_interfaces"]:
@@ -104,11 +105,14 @@ if image.returncode:
     errors.append(f"missing Docker image: {config['image']}")
 
 container = subprocess.run(
-    ["docker", "container", "inspect", config["container_name"]],
-    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ["docker", "container", "inspect", "--format", "{{.State.Running}}", config["container_name"]],
+    check=False, capture_output=True, text=True,
 )
 if not container.returncode:
-    errors.append(f"container already exists: {config['container_name']}")
+    if container.stdout.strip() == "true":
+        errors.append(f"container is already running: {config['container_name']}")
+    else:
+        notes.append(f"exited container {config['container_name']} will be removed before launch")
 
 for port in config["ports"]:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -118,7 +122,7 @@ for port in config["ports"]:
         except OSError as exc:
             errors.append(f"port {port} is unavailable: {exc}")
 
-print(json.dumps(errors))
+print(json.dumps({"errors": errors, "notes": notes}))
 raise SystemExit(bool(errors))
 `
 
@@ -160,49 +164,21 @@ func pathCheck(name, path string, executable bool) CheckResult {
 	return CheckResult{name, "PASS", path}
 }
 
-func modelConfigCheck(spec LaunchSpec) CheckResult {
-	if spec.CheckpointPath == nil {
-		return CheckResult{"model config", "PASS", fmt.Sprintf("%q will be updated in the Hugging Face cache by lil before launch", spec.ModelSource)}
-	}
-	path := filepath.Join(*spec.CheckpointPath, "config.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return CheckResult{"model config", "FAIL", fmt.Sprintf("cannot read %s: %v", path, err)}
-	}
-	var config map[string]any
-	if err := json.Unmarshal(data, &config); err != nil {
-		return CheckResult{"model config", "FAIL", fmt.Sprintf("cannot read %s: %v", path, err)}
-	}
-	rawArchitectures, ok := config["architectures"].([]any)
-	if !ok {
-		return CheckResult{"model architecture", "FAIL", "architectures is absent in " + path}
-	}
-	architectures := make([]string, 0, len(rawArchitectures))
-	for _, raw := range rawArchitectures {
-		if value, ok := raw.(string); ok {
-			architectures = append(architectures, value)
+func modelFactsCheck(spec LaunchSpec) CheckResult {
+	facts, _ := spec.Metadata["checkpoint_facts"].(map[string]any)
+	architectures, _ := facts["architectures"].([]string)
+	heads, _ := facts["attention_heads"].(int)
+	source, _ := facts["source"].(string)
+	if spec.CheckpointPath != nil {
+		local, err := LoadCheckpointFacts(*spec.CheckpointPath)
+		if err != nil {
+			return CheckResult{"model architecture", "FAIL", err.Error()}
+		}
+		if !sameArchitectures(local.Architectures, architectures) || local.AttentionHeads != heads {
+			return CheckResult{"model architecture", "FAIL", fmt.Sprintf("checkpoint changed since the launch was resolved: %v with %d heads", local.Architectures, local.AttentionHeads)}
 		}
 	}
-	expected := stringSet(spec.Model.ExpectedArchitectures...)
-	match := false
-	for _, architecture := range architectures {
-		if !expected[architecture] {
-			return CheckResult{"model architecture", "FAIL", fmt.Sprintf("expected %v, got %v", spec.Model.ExpectedArchitectures, architectures)}
-		}
-		match = true
-	}
-	if !match {
-		return CheckResult{"model architecture", "FAIL", fmt.Sprintf("expected %v, got %v", spec.Model.ExpectedArchitectures, architectures)}
-	}
-	model := modelConfig(config)
-	heads, ok := jsonInteger(model["num_attention_heads"])
-	if !ok || heads != int64(spec.Model.AttentionHeads) {
-		return CheckResult{"model architecture", "FAIL", fmt.Sprintf("expected %d attention heads, got %v", spec.Model.AttentionHeads, model["num_attention_heads"])}
-	}
-	if heads%int64(spec.TPSize) != 0 {
-		return CheckResult{"model architecture", "FAIL", fmt.Sprintf("%d attention heads are not divisible by TP=%d", heads, spec.TPSize)}
-	}
-	return CheckResult{"model architecture", "PASS", fmt.Sprintf("%s, %d heads, TP=%d", architectures[0], heads, spec.TPSize)}
+	return CheckResult{"model architecture", "PASS", fmt.Sprintf("%s, %d heads, TP=%d (%s)", strings.Join(architectures, ","), heads, spec.TPSize, source)}
 }
 
 func environmentForSpec(spec LaunchSpec) []string {
@@ -239,38 +215,9 @@ func environmentList(values map[string]string) []string {
 	return result
 }
 
-func runCommand(timeout time.Duration, directory string, environment []string, argv []string) ([]byte, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	command.Dir = directory
-	if environment != nil {
-		command.Env = environment
-	}
-	output, err := command.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
-		return output, -1, fmt.Errorf("command timed out after %s", timeout)
-	}
-	if err == nil {
-		return output, 0, nil
-	}
-	if exit, ok := err.(*exec.ExitError); ok {
-		return output, exit.ExitCode(), nil
-	}
-	return output, -1, err
-}
-
-func lastOutputLine(output []byte, fallback string) string {
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) == 0 || lines[0] == "" {
-		return fallback
-	}
-	return lines[len(lines)-1]
-}
-
-func importCheck(spec LaunchSpec) CheckResult {
+func importCheck(ctx context.Context, spec LaunchSpec) CheckResult {
 	argv := []string{spec.Topology.Python(), "-c", "import b12x, vllm, yaml"}
-	output, status, err := runCommand(30*time.Second, spec.Topology.RepoRoot(), environmentForSpec(spec), argv)
+	output, status, err := runCommand(ctx, 30*time.Second, spec.Topology.RepoRoot(), environmentForSpec(spec), argv)
 	if err != nil {
 		return CheckResult{"Python imports", "FAIL", err.Error()}
 	}
@@ -289,14 +236,14 @@ func serveArguments(argv []string) ([]string, bool) {
 	return nil, false
 }
 
-func vllmArgvCheck(spec LaunchSpec) CheckResult {
+func vllmArgvCheck(ctx context.Context, spec LaunchSpec) CheckResult {
 	arguments, ok := serveArguments(spec.VLLMArgv)
 	if !ok {
 		return CheckResult{"vLLM argv", "FAIL", "serve subcommand is absent"}
 	}
 	encoded, _ := json.Marshal(arguments)
 	argv := []string{spec.Topology.Python(), "-c", parseVLLMArgv, string(encoded)}
-	output, status, err := runCommand(30*time.Second, spec.Topology.RepoRoot(), environmentForSpec(spec), argv)
+	output, status, err := runCommand(ctx, 30*time.Second, spec.Topology.RepoRoot(), environmentForSpec(spec), argv)
 	if err != nil {
 		return CheckResult{"vLLM argv", "FAIL", err.Error()}
 	}
@@ -306,7 +253,7 @@ func vllmArgvCheck(spec LaunchSpec) CheckResult {
 	return CheckResult{"vLLM argv", "PASS", fmt.Sprintf("%d arguments accepted by the installed serve parser", len(arguments))}
 }
 
-func gpuCheck(spec LaunchSpec) CheckResult {
+func gpuCheck(ctx context.Context, spec LaunchSpec) CheckResult {
 	if spec.Topology.Local == nil || spec.DeviceIDs == nil {
 		return CheckResult{"GPU inventory", "PASS", "one configured GPU per Spark/RDMA node"}
 	}
@@ -314,7 +261,7 @@ func gpuCheck(spec LaunchSpec) CheckResult {
 	if err != nil {
 		return CheckResult{"GPU inventory", "FAIL", "nvidia-smi is not on PATH"}
 	}
-	output, status, err := runCommand(10*time.Second, "", nil, []string{nvidiaSMI, "--query-gpu=index,name", "--format=csv,noheader"})
+	output, status, err := runCommand(ctx, 10*time.Second, "", nil, []string{nvidiaSMI, "--query-gpu=index,name", "--format=csv,noheader"})
 	if err != nil {
 		return CheckResult{"GPU inventory", "FAIL", err.Error()}
 	}
@@ -353,18 +300,19 @@ func portCheck(spec LaunchSpec) CheckResult {
 	return CheckResult{"API port", "PASS", fmt.Sprintf("%s:%d is available", spec.Host, spec.Port)}
 }
 
-func remoteRun(host string, argv []string, timeout time.Duration) ([]byte, int, error) {
-	return runCommand(timeout, "", nil, RemoteArgv(host, argv))
+type nodeProbeResult struct {
+	Errors []string `json:"errors"`
+	Notes  []string `json:"notes"`
 }
 
-func sparkNodeCheck(spec LaunchSpec, index int) CheckResult {
+func sparkNodeCheck(ctx context.Context, spec LaunchSpec, index int) CheckResult {
 	topology := spec.Topology.Spark
 	launch := spec.SparkNodes[index]
-	var peer any
+	name := fmt.Sprintf("Spark node %d", index)
+	peers := []string{}
 	for _, candidate := range spec.SparkNodes {
 		if candidate.Rank != launch.Rank {
-			peer = candidate.Node.Address
-			break
+			peers = append(peers, candidate.Node.Address)
 		}
 	}
 	paths := [][]string{
@@ -388,44 +336,53 @@ func sparkNodeCheck(spec LaunchSpec, index int) CheckResult {
 		ports = []int{spec.Port, topology.MasterPort}
 	}
 	payload := map[string]any{
-		"address": launch.Node.Address, "peer_address": peer,
+		"address": launch.Node.Address, "peer_addresses": peers,
 		"ethernet_interface": launch.Node.EthernetInterface,
 		"rdma_interfaces":    launch.Node.RDMAInterfaces, "device_id": topology.DeviceID,
 		"image": topology.Image, "container_name": launch.ContainerName,
 		"ports": ports, "paths": paths,
 	}
 	encoded, _ := json.Marshal(payload)
-	output, status, err := remoteRun(launch.Node.SSHHost, []string{topology.RuntimePython, "-c", sparkNodeProbe, string(encoded)}, 60*time.Second)
+	output, status, err := remoteRun(ctx, launch.Node.SSHHost, []string{topology.RuntimePython, "-c", sparkNodeProbe, string(encoded)}, 60*time.Second)
 	if err != nil {
-		return CheckResult{fmt.Sprintf("Spark node %d", index), "FAIL", fmt.Sprintf("%s: %v", launch.Node.SSHHost, err)}
+		return CheckResult{name, "FAIL", fmt.Sprintf("%s: %v", launch.Node.SSHHost, err)}
 	}
-	if status != 0 {
-		return CheckResult{fmt.Sprintf("Spark node %d", index), "FAIL", fmt.Sprintf("%s: %s", launch.Node.SSHHost, lastOutputLine(output, "probe failed"))}
+	var result nodeProbeResult
+	if decodeErr := json.Unmarshal([]byte(lastOutputLine(output, "{}")), &result); decodeErr != nil || status != 0 && len(result.Errors) == 0 {
+		return CheckResult{name, "FAIL", fmt.Sprintf("%s: %s", launch.Node.SSHHost, lastOutputLine(output, "probe failed"))}
 	}
-	return CheckResult{fmt.Sprintf("Spark node %d", index), "PASS", fmt.Sprintf("%s (%s), GPU %d, %s", launch.Node.SSHHost, launch.Node.Address, topology.DeviceID, strings.Join(launch.Node.RDMAInterfaces, ","))}
+	if len(result.Errors) > 0 {
+		return CheckResult{name, "FAIL", fmt.Sprintf("%s: %s", launch.Node.SSHHost, strings.Join(result.Errors, "; "))}
+	}
+	detail := fmt.Sprintf("%s (%s), GPU %d, %s", launch.Node.SSHHost, launch.Node.Address, topology.DeviceID, strings.Join(launch.Node.RDMAInterfaces, ","))
+	if len(result.Notes) > 0 {
+		detail += "; " + strings.Join(result.Notes, "; ")
+	}
+	return CheckResult{name, "PASS", detail}
 }
 
-func sparkRuntimeCheck(spec LaunchSpec, index int) CheckResult {
+// sparkRuntimeCheck parses the rank's argv inside the launch image with the
+// launch mounts and environment, so the interpreter, imports, and parser that
+// are validated are the ones the container will run.
+func sparkRuntimeCheck(ctx context.Context, spec LaunchSpec, index int) CheckResult {
 	topology := spec.Topology.Spark
 	launch := spec.SparkNodes[index]
+	name := fmt.Sprintf("Spark runtime %d", index)
 	arguments, ok := serveArguments(launch.VLLMArgv)
 	if !ok {
-		return CheckResult{fmt.Sprintf("Spark runtime %d", index), "FAIL", "serve subcommand is absent"}
+		return CheckResult{name, "FAIL", "serve subcommand is absent"}
 	}
 	encoded, _ := json.Marshal(arguments)
-	environment := []string{"/usr/bin/env"}
-	for _, name := range sortedMapKeys(launch.RuntimeEnvironment) {
-		environment = append(environment, name+"="+launch.RuntimeEnvironment[name])
-	}
-	environment = append(environment, topology.RuntimePython, "-c", "import b12x, yaml\n"+parseVLLMArgv, string(encoded))
-	output, status, err := remoteRun(launch.Node.SSHHost, environment, 60*time.Second)
+	argv := sparkDockerRun(topology, sparkMounts(topology, spec.CheckpointPath, launch.VLLMArgv), launch.RuntimeEnvironment, "", nil)
+	argv = append(argv, topology.RuntimePython, "-c", "import b12x, yaml\n"+parseVLLMArgv, string(encoded))
+	output, status, err := remoteRun(ctx, launch.Node.SSHHost, argv, 5*time.Minute)
 	if err != nil {
-		return CheckResult{fmt.Sprintf("Spark runtime %d", index), "FAIL", fmt.Sprintf("%s: %v", launch.Node.SSHHost, err)}
+		return CheckResult{name, "FAIL", fmt.Sprintf("%s: %v", launch.Node.SSHHost, err)}
 	}
 	if status != 0 {
-		return CheckResult{fmt.Sprintf("Spark runtime %d", index), "FAIL", fmt.Sprintf("%s: %s", launch.Node.SSHHost, lastOutputLine(output, "runtime parser failed"))}
+		return CheckResult{name, "FAIL", fmt.Sprintf("%s: %s", launch.Node.SSHHost, lastOutputLine(output, "container runtime check failed"))}
 	}
-	return CheckResult{fmt.Sprintf("Spark runtime %d", index), "PASS", fmt.Sprintf("%s: imports and rank %d argv accepted", launch.Node.SSHHost, index)}
+	return CheckResult{name, "PASS", fmt.Sprintf("%s: imports and rank %d argv accepted inside %s", launch.Node.SSHHost, index, topology.Image)}
 }
 
 func ignoredDigestPath(path string) bool {
@@ -497,7 +454,7 @@ func localSourceDigest(roots []string) (string, error) {
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func sparkSourceCheck(spec LaunchSpec) CheckResult {
+func sparkSourceCheck(ctx context.Context, spec LaunchSpec) CheckResult {
 	topology := spec.Topology.Spark
 	digest, err := localSourceDigest([]string{filepath.Join(topology.RepoRoot, "vllm"), filepath.Join(topology.B12XRoot, "b12x")})
 	if err != nil {
@@ -506,7 +463,7 @@ func sparkSourceCheck(spec LaunchSpec) CheckResult {
 	type hostDigest struct{ host, digest string }
 	digests := []hostDigest{{"controller", digest}}
 	for _, launch := range spec.SparkNodes {
-		output, status, err := remoteRun(launch.Node.SSHHost, []string{topology.RuntimePython, "-c", sourceDigestScript, filepath.Join(topology.RuntimeRepoRoot, "vllm"), filepath.Join(topology.RuntimeB12XRoot, "b12x")}, 120*time.Second)
+		output, status, err := remoteRun(ctx, launch.Node.SSHHost, []string{topology.RuntimePython, "-c", sourceDigestScript, filepath.Join(topology.RuntimeRepoRoot, "vllm"), filepath.Join(topology.RuntimeB12XRoot, "b12x")}, 120*time.Second)
 		if err != nil {
 			return CheckResult{"Spark source parity", "FAIL", fmt.Sprintf("%s: %v", launch.Node.SSHHost, err)}
 		}
@@ -527,27 +484,38 @@ func sparkSourceCheck(spec LaunchSpec) CheckResult {
 		}
 		return CheckResult{"Spark source parity", "FAIL", strings.Join(parts, ", ")}
 	}
-	return CheckResult{"Spark source parity", "PASS", "vLLM+B12X digest " + digest[:12] + " on all nodes"}
+	return CheckResult{"Spark source parity", "PASS", "vLLM+B12X Python digest " + digest[:12] + " on all nodes (native extensions are not compared)"}
 }
 
-func sparkChecks(spec LaunchSpec) []CheckResult {
+func sparkChecks(ctx context.Context, spec LaunchSpec) []CheckResult {
 	var results []CheckResult
 	nodesReady := true
 	for index := range spec.SparkNodes {
-		node := sparkNodeCheck(spec, index)
+		node := sparkNodeCheck(ctx, spec, index)
 		results = append(results, node)
 		nodesReady = nodesReady && !node.Failed()
 		if !node.Failed() {
-			results = append(results, sparkRuntimeCheck(spec, index))
+			results = append(results, sparkRuntimeCheck(ctx, spec, index))
 		}
 	}
 	if nodesReady {
-		results = append(results, sparkSourceCheck(spec))
+		results = append(results, sparkSourceCheck(ctx, spec))
 	}
 	return results
 }
 
-func RunChecks(spec LaunchSpec, checkPort bool) []CheckResult {
+// RecheckSparkNodes repeats only the per-node host probes. It runs after a
+// long cache update so that port and container conflicts that appeared in
+// the meantime are caught before containers start.
+func RecheckSparkNodes(ctx context.Context, spec LaunchSpec) []CheckResult {
+	results := make([]CheckResult, 0, len(spec.SparkNodes))
+	for index := range spec.SparkNodes {
+		results = append(results, sparkNodeCheck(ctx, spec, index))
+	}
+	return results
+}
+
+func RunChecks(ctx context.Context, spec LaunchSpec, checkPort bool) []CheckResult {
 	results := []CheckResult{
 		pathCheck("runtime executable", spec.Topology.Python(), true),
 		pathCheck("vLLM source", filepath.Join(spec.Topology.RepoRoot(), "vllm", "__init__.py"), false),
@@ -556,12 +524,12 @@ func RunChecks(spec LaunchSpec, checkPort bool) []CheckResult {
 	if spec.Topology.Local != nil {
 		results = append(results, pathCheck("CUDA ptxas", filepath.Join(spec.Topology.CUDAHome(), "bin", "ptxas"), true))
 	}
-	results = append(results, modelConfigCheck(spec), gpuCheck(spec), importCheck(spec), vllmArgvCheck(spec))
+	results = append(results, modelFactsCheck(spec), gpuCheck(ctx, spec), importCheck(ctx, spec), vllmArgvCheck(ctx, spec))
 	if checkPort && spec.Topology.Local != nil {
 		results = append(results, portCheck(spec))
 	}
 	if spec.Topology.Spark != nil {
-		results = append(results, sparkChecks(spec)...)
+		results = append(results, sparkChecks(ctx, spec)...)
 	}
 	return results
 }

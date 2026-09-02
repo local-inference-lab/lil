@@ -92,6 +92,10 @@ func TestResolveChecksRepositoryHeadAndFetchesItsManifest(t *testing.T) {
 		}
 		switch request.URL.Path {
 		case "/api/models/local-inference-lab/Model":
+			if request.URL.Query().Get("blobs") != "true" {
+				http.Error(writer, "sizes require blobs=true", http.StatusBadRequest)
+				return
+			}
 			count := resolves.Add(1)
 			revision := testRevision
 			if count > 1 {
@@ -99,13 +103,15 @@ func TestResolveChecksRepositoryHeadAndFetchesItsManifest(t *testing.T) {
 			}
 			fmt.Fprintf(
 				writer,
-				`{"id":"local-inference-lab/Model","sha":"%s","siblings":[{"rfilename":"lil.yaml"}]}`,
+				`{"id":"local-inference-lab/Model","sha":"%s","siblings":[{"rfilename":"lil.yaml","size":40},{"rfilename":"config.json","size":12},{"rfilename":"model-00001.safetensors","size":1000},{"rfilename":"model-00002.safetensors","size":2000}]}`,
 				revision,
 			)
 		case "/local-inference-lab/Model/resolve/" + testRevision + "/lil.yaml":
 			fmt.Fprint(writer, "schema_version: 1\nkind: model\ndescription: first\n")
 		case "/local-inference-lab/Model/resolve/" + secondTestRevision + "/lil.yaml":
 			fmt.Fprint(writer, "schema_version: 1\nkind: model\ndescription: second\n")
+		case "/local-inference-lab/Model/resolve/" + testRevision + "/config.json":
+			fmt.Fprint(writer, `{"architectures":["X"]}`)
 		default:
 			http.NotFound(writer, request)
 		}
@@ -124,6 +130,19 @@ func TestResolveChecksRepositoryHeadAndFetchesItsManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sizes, cached, err := client.FetchSizes(context.Background(), first)
+	if err != nil || cached || SafetensorsBytes(sizes) != 3000 {
+		t.Fatalf("sizes from resolve: %v cached=%t error=%v", sizes, cached, err)
+	}
+	config, _, err := client.FetchFile(context.Background(), first, "config.json", ConfigLimit)
+	if err != nil || !strings.Contains(string(config), "architectures") {
+		t.Fatalf("config fetch: %q %v", config, err)
+	}
+	listing := Repository{ID: first.ID, Revision: first.Revision, Siblings: []Sibling{{Filename: "lil.yaml"}}}
+	sizes, cached, err = client.FetchSizes(context.Background(), listing)
+	if err != nil || !cached || SafetensorsBytes(sizes) != 3000 {
+		t.Fatalf("sizes from cache: %v cached=%t error=%v", sizes, cached, err)
+	}
 	second, err := client.Resolve(context.Background(), "Model")
 	if err != nil {
 		t.Fatal(err)
@@ -139,6 +158,9 @@ func TestResolveChecksRepositoryHeadAndFetchesItsManifest(t *testing.T) {
 			"repository head was not refreshed: first=%+v second=%+v manifests=%q/%q",
 			first, second, firstManifest, secondManifest,
 		)
+	}
+	if _, _, err := client.FetchFile(context.Background(), first, "../etc/passwd", ConfigLimit); err == nil {
+		t.Fatal("path traversal in repository file name was accepted")
 	}
 
 	fail.Store(true)

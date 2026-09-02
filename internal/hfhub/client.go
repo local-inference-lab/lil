@@ -21,20 +21,30 @@ import (
 
 const defaultEndpoint = "https://huggingface.co"
 
+// Size caps for files fetched from a repository at a resolved commit.
+const (
+	ManifestLimit = 1 << 20
+	ConfigLimit   = 16 << 20
+)
+
 var (
 	repositoryIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	revisionPattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	nextLinkPattern     = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+	repositoryFilePath  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 )
+
+type Sibling struct {
+	Filename string `json:"rfilename"`
+	Size     int64  `json:"size,omitempty"`
+}
 
 type Repository struct {
 	ID           string    `json:"id"`
 	Revision     string    `json:"sha"`
 	Private      bool      `json:"private"`
 	LastModified time.Time `json:"lastModified"`
-	Siblings     []struct {
-		Filename string `json:"rfilename"`
-	} `json:"siblings"`
+	Siblings     []Sibling `json:"siblings"`
 }
 
 func (repository Repository) HasFile(filename string) bool {
@@ -44,6 +54,36 @@ func (repository Repository) HasFile(filename string) bool {
 		}
 	}
 	return false
+}
+
+// HasSizes reports whether the listing carries file sizes, which the Hub
+// returns only for a single-repository query with blobs=true.
+func (repository Repository) HasSizes() bool {
+	for _, sibling := range repository.Siblings {
+		if sibling.Size > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (repository Repository) sizes() map[string]int64 {
+	sizes := make(map[string]int64, len(repository.Siblings))
+	for _, sibling := range repository.Siblings {
+		sizes[sibling.Filename] = sibling.Size
+	}
+	return sizes
+}
+
+// SafetensorsBytes sums the stored size of every safetensors shard.
+func SafetensorsBytes(sizes map[string]int64) int64 {
+	var total int64
+	for name, size := range sizes {
+		if strings.HasSuffix(name, ".safetensors") {
+			total += size
+		}
+	}
+	return total
 }
 
 type Discovery struct {
@@ -269,6 +309,7 @@ func (client *Client) NormalizeRepository(model string) (string, error) {
 	return model, nil
 }
 
+// Resolve fetches the repository's head commit and file listing with sizes.
 func (client *Client) Resolve(ctx context.Context, model string) (Repository, error) {
 	id, err := client.NormalizeRepository(model)
 	if err != nil {
@@ -278,7 +319,7 @@ func (client *Client) Resolve(ctx context.Context, model string) (Repository, er
 		return client.resolveCached(id)
 	}
 	owner, name, _ := strings.Cut(id, "/")
-	target := client.endpoint() + "/api/models/" + url.PathEscape(owner) + "/" + url.PathEscape(name)
+	target := client.endpoint() + "/api/models/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "?blobs=true"
 	response, err := client.request(ctx, http.MethodGet, target)
 	if err != nil {
 		return Repository{}, fmt.Errorf("cannot resolve Hugging Face repository %s: %w", id, err)
@@ -295,6 +336,9 @@ func (client *Client) Resolve(ctx context.Context, model string) (Repository, er
 		return Repository{}, err
 	}
 	client.mergeCatalog(repository)
+	if repository.HasSizes() {
+		_ = client.writeSizes(repository)
+	}
 	return repository, nil
 }
 
@@ -335,53 +379,115 @@ func (client *Client) mergeCatalog(repository Repository) {
 	_ = client.writeCatalog(repositories)
 }
 
-func (client *Client) manifestPath(repository Repository) (string, error) {
+func (client *Client) revisionDir(repository Repository) (string, error) {
 	if !repositoryIDPattern.MatchString(repository.ID) || !revisionPattern.MatchString(repository.Revision) {
 		return "", fmt.Errorf("invalid Hugging Face repository metadata")
 	}
 	return filepath.Join(
-		client.CacheDir,
-		"manifests",
-		strings.ReplaceAll(repository.ID, "/", "--"),
-		repository.Revision,
-		"lil.yaml",
+		client.CacheDir, "repositories",
+		strings.ReplaceAll(repository.ID, "/", "--"), repository.Revision,
 	), nil
 }
 
-func (client *Client) FetchManifest(ctx context.Context, repository Repository) ([]byte, bool, error) {
-	if !repository.HasFile("lil.yaml") {
-		return nil, false, fmt.Errorf("%s does not contain lil.yaml", repository.ID)
+// FetchFile returns a root-level file from the repository at its resolved
+// commit. Bytes cached for that immutable commit are reused.
+func (client *Client) FetchFile(ctx context.Context, repository Repository, name string, limit int64) ([]byte, bool, error) {
+	if !repositoryFilePath.MatchString(name) {
+		return nil, false, fmt.Errorf("unsupported repository file name %q", name)
 	}
-	path, err := client.manifestPath(repository)
+	if !repository.HasFile(name) {
+		return nil, false, fmt.Errorf("%s does not contain %s", repository.ID, name)
+	}
+	directory, err := client.revisionDir(repository)
 	if err != nil {
 		return nil, false, err
 	}
+	path := filepath.Join(directory, name)
 	if data, err := os.ReadFile(path); err == nil {
 		return data, true, nil
 	}
 	if client.Offline {
-		return nil, false, fmt.Errorf("lil.yaml for %s@%s is not cached", repository.ID, repository.Revision)
+		return nil, false, fmt.Errorf("%s for %s@%s is not cached", name, repository.ID, repository.Revision)
 	}
-	owner, name, _ := strings.Cut(repository.ID, "/")
-	target := client.endpoint() + "/" + url.PathEscape(owner) + "/" + url.PathEscape(name) +
-		"/resolve/" + repository.Revision + "/lil.yaml"
+	owner, repositoryName, _ := strings.Cut(repository.ID, "/")
+	target := client.endpoint() + "/" + url.PathEscape(owner) + "/" + url.PathEscape(repositoryName) +
+		"/resolve/" + repository.Revision + "/" + url.PathEscape(name)
 	response, err := client.request(ctx, http.MethodGet, target)
 	if err != nil {
-		return nil, false, fmt.Errorf("cannot fetch %s: %w", repository.ID+"/lil.yaml", err)
+		return nil, false, fmt.Errorf("cannot fetch %s/%s: %w", repository.ID, name, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("cannot fetch %s: %w", repository.ID+"/lil.yaml", responseError(response))
+		return nil, false, fmt.Errorf("cannot fetch %s/%s: %w", repository.ID, name, responseError(response))
 	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(response.Body, limit))
 	if err != nil {
 		return nil, false, err
 	}
-	if len(data) == 1<<20 {
-		return nil, false, fmt.Errorf("%s/lil.yaml exceeds 1 MiB", repository.ID)
+	if int64(len(data)) == limit {
+		return nil, false, fmt.Errorf("%s/%s exceeds %d bytes", repository.ID, name, limit)
 	}
 	if err := atomicWrite(path, data); err != nil {
-		return nil, false, fmt.Errorf("cannot cache %s/lil.yaml: %w", repository.ID, err)
+		return nil, false, fmt.Errorf("cannot cache %s/%s: %w", repository.ID, name, err)
 	}
 	return data, false, nil
+}
+
+func (client *Client) FetchManifest(ctx context.Context, repository Repository) ([]byte, bool, error) {
+	return client.FetchFile(ctx, repository, "lil.yaml", ManifestLimit)
+}
+
+func (client *Client) sizesPath(repository Repository) (string, error) {
+	directory, err := client.revisionDir(repository)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "sizes.json"), nil
+}
+
+func (client *Client) writeSizes(repository Repository) error {
+	path, err := client.sizesPath(repository)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(repository.sizes(), "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, append(data, '\n'))
+}
+
+// FetchSizes returns the byte size of every file at the repository's
+// resolved commit, reading the per-commit cache before querying the Hub.
+func (client *Client) FetchSizes(ctx context.Context, repository Repository) (map[string]int64, bool, error) {
+	if repository.HasSizes() {
+		return repository.sizes(), false, nil
+	}
+	path, err := client.sizesPath(repository)
+	if err != nil {
+		return nil, false, err
+	}
+	if data, err := os.ReadFile(path); err == nil {
+		var sizes map[string]int64
+		if json.Unmarshal(data, &sizes) == nil {
+			return sizes, true, nil
+		}
+	}
+	if client.Offline {
+		return nil, false, fmt.Errorf("file sizes for %s@%s are not cached", repository.ID, repository.Revision)
+	}
+	resolved, err := client.Resolve(ctx, repository.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if resolved.Revision != repository.Revision {
+		return nil, false, fmt.Errorf(
+			"%s moved from %s to %s while resolving file sizes; retry",
+			repository.ID, repository.Revision[:12], resolved.Revision[:12],
+		)
+	}
+	if !resolved.HasSizes() {
+		return nil, false, fmt.Errorf("Hugging Face returned no file sizes for %s", repository.ID)
+	}
+	return resolved.sizes(), false, nil
 }

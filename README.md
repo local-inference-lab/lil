@@ -2,10 +2,11 @@
 
 `lil` is a standalone Go launcher for local and Spark/RDMA vLLM deployments in
 the local inference lab. It discovers launchable models from the
-`local-inference-lab` Hugging Face account, resolves each repository's
-`lil.yaml`, combines it with inherited family policy and a discovered machine
-topology, and produces a typed vLLM invocation. Shell launcher scripts, Ray,
-Python wrappers, and external queueing layers are not part of the execution path.
+`local-inference-lab` Hugging Face account, reads each repository's `lil.yaml`
+and checkpoint metadata at the repository's head commit, combines them with a
+discovered machine topology, and produces a typed vLLM invocation. Shell
+launcher scripts, Ray, Python wrappers, and external queueing layers are not
+part of the execution path.
 
 ## Install
 
@@ -24,14 +25,16 @@ elsewhere:
 make install PREFIX=/usr/local
 ```
 
-The executable embeds shared model-family policy. Per-model manifests come
-from Hugging Face at runtime, and topology YAML is generated locally under
-`~/.config/lil/topologies`.
+The executable embeds the model families in `configs/models/_bases.yaml`.
+Per-model manifests and checkpoint facts come from Hugging Face at runtime, and
+topology YAML is generated locally under `~/.config/lil/topologies`.
 
 ## Discover the launch topology
 
-Local topology discovery records the vLLM checkout, CUDA installation, B12X
-checkout, GPU memory, compute capability, and every valid local GPU pool:
+A topology records hardware facts and host tuning. Local discovery records the
+vLLM checkout, CUDA installation, B12X checkout, GPU memory, compute
+capability, every valid local GPU pool, and the environment variables a launch
+on this host exports:
 
 ```bash
 lil discover local \
@@ -54,9 +57,24 @@ Repeated `--node` flags define rank order. Discovery validates remote GPU,
 RDMA, interface, path, image, and cache compatibility before writing YAML. Use
 `--output -` to inspect the result or `--force` to replace an existing topology.
 
+Every topology carries two policy fields that discovery fills with defaults:
+
+- `default_tp` selects how a launch picks its tensor-parallel size when `--tp`
+  is absent. `fit` chooses the smallest size whose sharded weights leave KV
+  headroom on one rank; `all` uses every rank. Local discovery writes `fit`,
+  Spark discovery writes `all`, and `--default-tp` overrides either.
+- `environment` holds the host tuning exported by every launch on that
+  topology: allocator settings, thread counts, NCCL protocol and PCIe
+  all-reduce policy on local hosts, loader buffer sizes and RDMA routing on
+  Spark nodes. The block is required, so a topology written before it existed
+  must be rediscovered or edited. Values the launcher derives from topology
+  facts, such as `CUDA_HOME`, `CUTE_DSL_ARCH`, `CUDA_VISIBLE_DEVICES`, and the
+  per-rank interface variables, cannot appear in it.
+
 ## Run models
 
-List models carrying a valid `lil.yaml` and all discovered topologies:
+List models carrying a valid `lil.yaml`, their stored size, and the default
+tensor-parallel size on every discovered topology:
 
 ```bash
 lil list
@@ -81,8 +99,9 @@ Update the standard Hugging Face cache with visible progress and launch:
 lil run GLM-5.3-NVFP4 --config local --tp 8
 ```
 
-For Spark/RDMA, `lil run` updates the cache on every selected rank before
-starting workers and then the head:
+For Spark/RDMA, `lil run` updates the cache on every selected rank, repeats the
+per-node host probes so that a conflict that appeared during the download is
+caught, then starts workers and the head:
 
 ```bash
 lil run GLM-5.3-Flash-NVFP4-Spark \
@@ -90,12 +109,6 @@ lil run GLM-5.3-Flash-NVFP4-Spark \
   --tp 2 \
   --detach
 ```
-
-Spark preflight also hashes the importable `vllm/` and `b12x/` package trees on
-the controller and every selected rank. A mismatch fails closed before model
-download or container startup. `lil run --sync-code` explicitly reconciles
-those two remote package directories with `rsync --delete`, then reruns the
-same preflight; without that flag, `lil` never changes remote source trees.
 
 `--config local` and `--config spark` select the unique discovered topology of
 that kind. A topology name or YAML path selects an exact configuration.
@@ -109,10 +122,11 @@ lil run GLM-5.3-NVFP4 \
   --tp 8
 ```
 
-The local checkpoint is inspected to verify its architecture, stored size, and
-MTP expert quantization. A local `lil.yaml` is not used; model policy still
-comes from the repository's newest manifest. For a Spark topology,
-`--sync-model` incrementally copies an explicit `--model-path` to every rank.
+The local checkpoint must declare the same architectures and attention heads
+as the repository at its head commit, and its MTP expert quantization must
+agree with any assertion in the manifest. Its safetensors index sizes the
+memory estimate. For a Spark topology, `--sync-model` incrementally copies an
+explicit `--model-path` to every rank.
 
 Arguments after `--` are forwarded verbatim. Launcher-managed vLLM flags,
 including `--revision`, are rejected there so the command cannot contain
@@ -122,13 +136,18 @@ contradictory policy:
 lil render GLM-5.3-NVFP4 --tp 8 -- --disable-log-requests
 ```
 
+`--env NAME=VALUE` overrides a topology or manifest tuning value for one
+launch. Variables the launcher derives, and the offline switches it clears,
+cannot be overridden.
+
 ## Latest-model and cache contract
 
 `render`, `check`, `run`, and cluster commands resolve the requested repository
-through the Hugging Face API on every invocation. `lil` retrieves `lil.yaml`
-for the repository's head commit; bytes already cached for that immutable
-commit may be reused. Network resolution errors fail the command rather than
-silently using stale model policy.
+through the Hugging Face API on every invocation. At the repository's head
+commit `lil` reads three things: `lil.yaml`, `config.json`, and the size of
+every safetensors shard. Bytes already cached for that immutable commit are
+reused. Network resolution errors fail the command rather than silently using
+stale model policy.
 
 For DFlash, the draft repository head is resolved independently, its newest
 manifest is validated as `kind: draft`, and its compatibility list must contain
@@ -154,51 +173,70 @@ filesystem error fails the run.
 `list` may show a cached catalog with an explicit warning when Hugging Face
 discovery is temporarily unavailable. Launch commands do not use that fallback.
 
-## Model manifests and inheritance
+## Model manifests
 
 Every launchable repository in `local-inference-lab` owns one `lil.yaml` at its
-root. Identity is derived from the repository; manifests do not repeat a model
-path or contain revisions. Each serving manifest explicitly owns its
-checkpoint- and version-specific contract:
+root. The manifest states only what the checkpoint cannot state about itself.
+Architectures, attention heads, stored weight size, and the quantization of the
+MTP expert layer are read from `config.json` and the shard sizes at the
+resolved commit. Identity is the repository; manifests do not name a model or a
+revision.
 
 ```yaml
 schema_version: 1
 kind: model
-extends:
-  - glm
-  - full-graph
-description: GLM-5.3 with NVFP4 routed experts and a BF16 MTP expert layer
-weight_bytes: 464823066832
-served_model_name: GLM-5.3
-expected_architectures:
-  - GlmMoeDsaForCausalLM
-trust_remote_code: true
-async_scheduling: true
-generation_config: vllm
-hf_overrides: {}
-long_prefill_token_threshold: 2048
-default_speculator: mtp
-mtp_tokens: 3
-mtp_attention_backend: B12X
-mtp_model: target
-mtp_draft_sample_method: probabilistic
-cuda_device_max_connections: 32
-launch:
-  local:
-    default_tp_size: 8
-  spark_rdma:
-    default_tp_size: all
-quantization: null
-mtp_moe_quantization: bf16
+family: glm
+description: GLM-5.3 with NVFP4 routed experts and an unquantized BF16 MTP expert layer
+serving:
+  served_model_name: GLM-5.3
+  trust_remote_code: true
+  async_scheduling: true
+  generation_config: vllm
+  long_prefill_token_threshold: 2048
+speculators:
+  default: mtp
+  mtp:
+    tokens: 3
+    moe_quantization: bf16
+    attention: B12X
+    draft_sample_method: probabilistic
+    model: target
+compilation:
+  cudagraph_mode: FULL_AND_PIECEWISE
+  custom_ops:
+    - all
+environment:
+  CUDA_DEVICE_MAX_CONNECTIONS: "32"
 ```
 
-The embedded `_bases.yaml` holds only cross-model policy and broad family
-contracts shared by multiple repositories. It does not contain bases named for
-a checkpoint or model version. Remote manifests extend those semantic bases and
-own architecture subsets, serving identities, multimodal behavior, speculation,
-and other model-specific policy. Mappings merge recursively; scalars and lists
-replace inherited values. Unknown fields, duplicate definitions, missing
-parents, inheritance cycles, and invalid resolved types fail closed.
+The sections:
+
+- `family` names one entry in the embedded families file. Family mappings
+  merge under the manifest; a scalar, list, or explicit `null` in the manifest
+  replaces the family value.
+- `serving` holds the API-facing policy: served name, remote code, parsers,
+  tool choice, generation config, scheduler switches, and multimodal limits.
+  `auto_tool_choice` defaults to true when a tool parser is set. Prefix caching
+  and chunked prefill default to on. A manifest without parsers or a tool
+  parser emits none of those flags.
+- `kernels` holds dtype, quantization, attention, linear, MoE, and GDN decode
+  backends, block size, Mamba cache mode, FlashInfer autotuning, and the weight
+  loader. Defaults are bfloat16, the B12X linear and MoE backends, and the
+  instanttensor loader.
+- `speculators` names a `default` of `mtp`, `dflash`, or `none` (the default)
+  and a section per method. `mtp.moe_quantization` is an assertion checked
+  against the checkpoint; it is required only when the checkpoint metadata
+  cannot decide. NVFP4 experts use the B12X backend, MXFP8 and BF16 use Triton.
+- `capacity`, `compilation`, and `environment` are the base launch layer.
+  Capacity defaults are `max_model_len: auto`, eight sequences, and 4096
+  batched tokens. A compilation mapping enables `--compilation-config` with
+  computed CUDA graph capture sizes.
+- `overrides` is an ordered list of layers applied when every condition in
+  `when` matches the launch. Conditions are `kind` (`local` or `spark_rdma`),
+  `arch` (the topology's CuTe DSL architecture, such as `sm_121a`), and `tp`.
+  Later overrides win.
+- `requires.arch` lists the architectures a checkpoint may run on. A launch on
+  any other topology fails, and `lil list` marks the topology.
 
 Draft repositories use a separate schema and do not appear as launchable
 models:
@@ -213,43 +251,43 @@ compatible_models:
   - local-inference-lab/GLM-5.3-Flash-NVFP4
 ```
 
-`--models-config` accepts an explicit repository-layout manifest directory or
-legacy combined YAML for development and tests. It is never the default model
-source.
+`--models-config DIRECTORY` reads manifests from `<model>/lil.yaml` under a
+local directory, with each model's `config.json` and
+`model.safetensors.index.json` beside the manifest, for development and tests.
+The fixtures under `internal/launcher/testdata/model-manifests` are the
+reference copies of the published manifests. Unknown keys, missing families,
+inheritance cycles, and invalid types fail closed.
 
 ## Policy ownership
 
 | Concern | Owner |
 | --- | --- |
-| Checkpoint identity, architecture, stored size, quantization, parsers, multimodal behavior, and speculation | repository `lil.yaml` plus inherited family base |
-| GPU inventory, CUDA path, memory-utilization ceiling, API bind defaults, local pools, SSH/RDMA layout, image, and cache mounts | discovered topology YAML |
-| TP, local checkpoint, bind overrides, KV dtype, scheduler limits, capacity, profiling, and speculation overrides | typed `lil` CLI |
-| Environment construction, kernel selection, graph capture sizes, local PCIe policy, RDMA policy, and native commands | Go launcher |
+| Architectures, attention heads, stored size, MTP expert quantization | repository `config.json` and shard sizes at the resolved commit |
+| Serving identity, parsers, kernel selection, speculation, capacity and compilation layers, conditional overrides | repository `lil.yaml` plus its family |
+| GPU inventory, CUDA path, memory-utilization ceiling, default TP policy, host tuning environment, API bind defaults, local pools, SSH/RDMA layout, image, and cache mounts | discovered topology YAML |
+| TP, local checkpoint, bind overrides, KV dtype, scheduler limits, capacity, profiling, speculation overrides, and one-off environment overrides | typed `lil` CLI |
+| Derived environment, default TP fit, graph capture sizes, native commands | Go launcher |
 | Loaded checkpoint truth, runtime imports, GPU state, paths, ports, HCAs, and vLLM argument compatibility | preflight checks |
 
-Every model can use every topology-supported TP size that divides its attention
-heads. Local discovery builds TP 1-N device pools; Spark selects the first N
-one-GPU ranks. `--kv-cache-dtype` defaults to `fp8`, `--max-model-len` defaults
-to `auto`, and scheduler concurrency defaults to eight rather than one. The
-topology owns `--gpu-memory-utilization`, with `0.95` written by discovery unless
-overridden.
-
-Multimodal arguments are emitted only by multimodal family profiles. MTP expert
-quantization chooses its backend: NVFP4 uses B12X; MXFP8 and BF16 use Triton. An
-explicit local checkpoint is inspected and must agree with the manifest hint.
+A launch may use any tensor-parallel size the topology can host that divides
+the checkpoint's attention heads. Local launches take the first device pool
+large enough; Spark launches take the first N one-GPU ranks.
+`--kv-cache-dtype` defaults to `fp8`. The topology owns
+`--gpu-memory-utilization`, with `0.95` written by discovery unless overridden.
 
 CUDA graph capture sizes are calculated from resolved scheduler and speculation
 settings. The set contains mixed batch sizes and every uniform decode batch
 through `max_num_seqs`; with MTP depth K, uniform verification shapes are
-sequence count multiplied by K+1. This includes shapes such as 12, 20, and 28
-for K=3 instead of relying on a static table.
+sequence count multiplied by K+1.
 
 ## Capacity
 
-`weight_bytes` lets `lil` estimate stored weights, post-TP-sharding device
-weights per rank, mapped-host PLE bytes, runtime reserve, and an advisory safe
-KV budget before downloading a checkpoint. An explicit local checkpoint uses
-its safetensors index instead. JSON rendering exposes every estimate term:
+The stored weight size lets `lil` estimate post-sharding device weights per
+rank, mapped-host PLE bytes for an explicit checkpoint, a runtime reserve, and
+an advisory safe KV budget before downloading a checkpoint. The same
+arithmetic picks the default tensor-parallel size under the `fit` policy. JSON
+rendering exposes every term, the supported TP sizes, the checkpoint facts and
+their source, and the manifest commit:
 
 ```bash
 lil render GLM-5.3-NVFP4 --tp 8 --format json
@@ -260,18 +298,43 @@ By default, `lil` emits the topology's `--gpu-memory-utilization` and leaves
 peak, and graph footprint. `--kv-cache-memory-bytes` requests a fixed allocation;
 `auto` restores runtime profiling.
 
-## Cluster lifecycle
+## Spark/RDMA lifecycle
 
-Detached Spark launches have deterministic container names:
+Rank containers are named deterministically from the topology prefix, model,
+and TP, and they are kept after exit. A crashed rank leaves its logs and exit
+code behind; the next launch removes an exited container of the same name and
+refuses a running one. Preflight parses each rank's arguments inside the launch
+image with the launch mounts and environment, so the interpreter and imports
+validated are the ones the container runs. Spark preflight also hashes the
+importable `vllm/` and `b12x/` Python trees on the controller and every
+selected rank; native extensions are not compared.
+
+Without `--detach`, the controller starts workers, then the head, streams the
+head's logs, and polls every rank. It tears the cluster down only when it
+observes a rank exit or is interrupted. A worker exit stops the head and prints
+the worker's last log lines; a head exit returns its exit code. Losing contact
+with the ranks never stops a running cluster: the controller reports the
+outage, keeps trying for ten minutes, then gives up and leaves the containers
+running for `lil cluster` to manage. Ctrl-C stops and removes every rank; a
+second Ctrl-C exits immediately.
+
+With `--detach`, the controller confirms every rank is still running a few
+seconds after start and returns.
 
 ```bash
 lil cluster status GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2
 lil cluster logs GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2 --follow
+lil cluster logs GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2 --rank 1
 lil cluster wait GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2 --timeout 30m
 lil cluster profile-start GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2
 lil cluster profile-stop GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2
 lil cluster stop GLM-5.3-Flash-NVFP4-Spark --config spark --tp 2
 ```
 
-The controller performs lifecycle and profiler requests over SSH. The head API
-does not need to be exposed to the controller network.
+`cluster stop` stops and removes every rank. The controller performs lifecycle
+and profiler requests over SSH with keepalives. The head API does not need to
+be exposed to the controller network.
+
+`lil run --sync-code` reconciles the two remote Python package directories
+with `rsync --delete`, then reruns preflight; without that flag, `lil` never
+changes remote source trees.

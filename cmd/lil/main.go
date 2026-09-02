@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -66,7 +67,7 @@ type launchFlags struct {
 
 func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bool) {
 	fs.StringVar(&values.config, "config", "", "discovered topology name or YAML path")
-	fs.StringVar(&values.modelsConfig, "models-config", "", "model profile YAML directory or file")
+	fs.StringVar(&values.modelsConfig, "models-config", "", "directory of <model>/lil.yaml manifests with config.json and safetensors index")
 	fs.IntVar(&values.tp, "tp", 0, "tensor parallel size")
 	fs.StringVar(&values.devices, "devices", "", "comma-separated local physical GPU IDs")
 	fs.StringVar(&values.modelPath, "model-path", "", "local checkpoint path")
@@ -81,7 +82,7 @@ func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bo
 	fs.IntVar(&values.maxNumBatchedTokens, "max-num-batched-tokens", 0, "maximum batched tokens")
 	fs.IntVar(&values.dcp, "dcp", 1, "decode context parallel size")
 	fs.StringVar(&values.dcpCommBackend, "dcp-comm-backend", "a2a", "DCP communication backend")
-	fs.StringVar(&values.speculator, "speculator", "", "mtp, dflash2, or none")
+	fs.StringVar(&values.speculator, "speculator", "", "mtp, dflash, or none")
 	fs.IntVar(&values.speculativeTokens, "speculative-tokens", 0, "speculative token count")
 	fs.BoolVar(&values.adaptiveSpeculativeTokens, "adaptive-speculative-tokens", false, "enable adaptive MTP depth")
 	fs.IntVar(&values.adaptiveWindow, "adaptive-window", 32, "adaptive MTP window")
@@ -96,7 +97,7 @@ func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bo
 	fs.BoolVar(&values.profileNoStack, "profile-no-stack", false, "disable profiler stacks")
 	fs.BoolVar(&values.profileNoGzip, "profile-no-gzip", false, "disable profiler gzip")
 	fs.IntVar(&values.profileMaxIterations, "profile-max-iterations", 4, "maximum profiled iterations")
-	fs.StringArrayVar(&values.environment, "env", nil, "additional NAME=VALUE environment entry")
+	fs.StringArrayVar(&values.environment, "env", nil, "NAME=VALUE environment entry overriding topology or manifest tuning")
 	fs.BoolVar(&values.detach, "detach", false, "leave Spark containers running")
 	if includeSync {
 		fs.BoolVar(&values.syncCode, "sync-code", false, "replace remote vllm/ and b12x/ packages before preflight")
@@ -194,50 +195,83 @@ func (values launchFlags) options(fs *pflag.FlagSet, extraArgs []string) (launch
 	return options, nil
 }
 
-func loadProfiles(path string) (map[string]launcher.ModelProfile, error) {
+func embeddedModelFamilies() ([]byte, error) {
+	return configassets.ModelBases.ReadFile("models/_bases.yaml")
+}
+
+// hubFacts reads config.json and the safetensors shard sizes at the
+// repository's resolved commit.
+func hubFacts(ctx context.Context, client *hfhub.Client, repository hfhub.Repository) (*launcher.CheckpointFacts, error) {
+	sizes, _, err := client.FetchSizes(ctx, repository)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := client.FetchFile(ctx, repository, "config.json", hfhub.ConfigLimit)
+	if err != nil {
+		return nil, err
+	}
+	source := repository.ID + "@" + repository.Revision[:12]
+	config, err := launcher.ParseCheckpointConfig(data, source+" config.json")
+	if err != nil {
+		return nil, err
+	}
+	return launcher.FactsFromConfig(config, hfhub.SafetensorsBytes(sizes), "Hub safetensors file sizes", source)
+}
+
+func hubModelProfile(ctx context.Context, client *hfhub.Client, families []byte, repository hfhub.Repository) (launcher.ModelProfile, string, error) {
+	label := repository.ID + "/lil.yaml"
+	manifest, _, err := client.FetchManifest(ctx, repository)
+	if err != nil {
+		return launcher.ModelProfile{}, "", err
+	}
+	kind, err := launcher.RepositoryManifestKind(manifest, label)
+	if err != nil {
+		return launcher.ModelProfile{}, "", err
+	}
+	if kind == "draft" {
+		_, err := launcher.LoadRepositoryDraftProfile(manifest, repository.ID, repository.Revision, label)
+		return launcher.ModelProfile{}, kind, err
+	}
+	profile, err := launcher.LoadRepositoryModelProfile(families, manifest, repository.ID, repository.Revision, label)
+	if err != nil {
+		return launcher.ModelProfile{}, "", err
+	}
+	profile.Facts, err = hubFacts(ctx, client, repository)
+	if err != nil {
+		return launcher.ModelProfile{}, "", err
+	}
+	return profile, kind, nil
+}
+
+func loadProfiles(ctx context.Context, path string) (map[string]launcher.ModelProfile, error) {
+	families, err := embeddedModelFamilies()
+	if err != nil {
+		return nil, err
+	}
 	if path == "" {
 		client, err := hfhub.DefaultClient(modelRepositoryOwner)
 		if err != nil {
 			return nil, err
 		}
-		discovery, err := client.Discover(context.Background())
+		discovery, err := client.Discover(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if discovery.Warning != "" {
 			fmt.Fprintln(os.Stderr, "warning:", discovery.Warning)
 		}
-		bases, err := embeddedModelBases()
-		if err != nil {
-			return nil, err
-		}
 		profiles := map[string]launcher.ModelProfile{}
 		for _, repository := range discovery.Repositories {
 			if !repository.HasFile("lil.yaml") {
 				continue
 			}
-			manifest, _, err := client.FetchManifest(context.Background(), repository)
+			profile, kind, err := hubModelProfile(ctx, client, families, repository)
 			if err != nil {
 				return nil, err
 			}
-			kind, err := launcher.RepositoryManifestKind(manifest, repository.ID+"/lil.yaml")
-			if err != nil {
-				return nil, err
+			if kind == "model" {
+				profiles[profile.Name] = profile
 			}
-			if kind == "draft" {
-				if _, err := launcher.LoadRepositoryDraftProfile(manifest, repository.ID, repository.Revision, repository.ID+"/lil.yaml"); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			profile, err := launcher.LoadRepositoryModelProfile(
-				bases, manifest, repository.ID, repository.Revision,
-				repository.ID+"/lil.yaml",
-			)
-			if err != nil {
-				return nil, err
-			}
-			profiles[profile.Name] = profile
 		}
 		return profiles, nil
 	}
@@ -245,79 +279,49 @@ func loadProfiles(path string) (map[string]launcher.ModelProfile, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, fmt.Errorf("cannot inspect model profiles %s: %w", abs, err)
-	}
-	if !info.IsDir() {
-		data, err := os.ReadFile(abs)
-		if err != nil {
-			return nil, fmt.Errorf("cannot read model profiles %s: %w", abs, err)
-		}
-		return launcher.LoadModelProfiles(data, abs)
-	}
 	entries, err := os.ReadDir(abs)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read model profile directory %s: %w", abs, err)
+		return nil, fmt.Errorf("cannot read model manifest directory %s: %w", abs, err)
 	}
-	repositoryManifests := make([]string, 0)
+	profiles := map[string]launcher.ModelProfile{}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		manifest := filepath.Join(abs, entry.Name(), "lil.yaml")
-		if info, statErr := os.Stat(manifest); statErr == nil && info.Mode().IsRegular() {
-			repositoryManifests = append(repositoryManifests, manifest)
+		directory := filepath.Join(abs, entry.Name())
+		manifestPath := filepath.Join(directory, "lil.yaml")
+		data, err := os.ReadFile(manifestPath)
+		if os.IsNotExist(err) {
+			continue
 		}
-	}
-	if len(repositoryManifests) > 0 {
-		bases, err := embeddedModelBases()
+		if err != nil {
+			return nil, fmt.Errorf("cannot read %s: %w", manifestPath, err)
+		}
+		kind, err := launcher.RepositoryManifestKind(data, manifestPath)
 		if err != nil {
 			return nil, err
 		}
-		sort.Strings(repositoryManifests)
-		profiles := map[string]launcher.ModelProfile{}
-		for _, manifestPath := range repositoryManifests {
-			data, err := os.ReadFile(manifestPath)
-			if err != nil {
-				return nil, fmt.Errorf("cannot read %s: %w", manifestPath, err)
-			}
-			kind, err := launcher.RepositoryManifestKind(data, manifestPath)
-			if err != nil {
+		repositoryID := modelRepositoryOwner + "/" + entry.Name()
+		if kind == "draft" {
+			if _, err := launcher.LoadRepositoryDraftProfile(data, repositoryID, "", manifestPath); err != nil {
 				return nil, err
 			}
-			repositoryID := modelRepositoryOwner + "/" + filepath.Base(filepath.Dir(manifestPath))
-			if kind == "draft" {
-				if _, err := launcher.LoadRepositoryDraftProfile(data, repositoryID, "", manifestPath); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			profile, err := launcher.LoadRepositoryModelProfile(bases, data, repositoryID, "", manifestPath)
-			if err != nil {
-				return nil, err
-			}
-			profiles[profile.Name] = profile
-		}
-		return profiles, nil
-	}
-	files := []launcher.ModelProfileFile{}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".yaml" {
 			continue
 		}
-		name := filepath.Join(abs, entry.Name())
-		data, err := os.ReadFile(name)
+		profile, err := launcher.LoadRepositoryModelProfile(families, data, repositoryID, "", manifestPath)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read model profile %s: %w", name, err)
+			return nil, err
 		}
-		files = append(files, launcher.ModelProfileFile{Label: name, Data: data})
+		profile.Facts, err = launcher.LoadCheckpointFacts(directory)
+		if err != nil {
+			return nil, err
+		}
+		profiles[profile.Name] = profile
 	}
-	return launcher.LoadModelProfileFiles(files)
-}
-
-func embeddedModelBases() ([]byte, error) {
-	return configassets.ModelBases.ReadFile("models/_bases.yaml")
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("no <model>/lil.yaml manifests were found under %s", abs)
+	}
+	return profiles, nil
 }
 
 func profileFromMap(profiles map[string]launcher.ModelProfile, model string) (launcher.ModelProfile, error) {
@@ -335,9 +339,9 @@ func profileFromMap(profiles map[string]launcher.ModelProfile, model string) (la
 	return profile, nil
 }
 
-func resolveModelProfile(model, modelsConfig string) (launcher.ModelProfile, error) {
+func resolveModelProfile(ctx context.Context, model, modelsConfig string) (launcher.ModelProfile, error) {
 	if modelsConfig != "" {
-		profiles, err := loadProfiles(modelsConfig)
+		profiles, err := loadProfiles(ctx, modelsConfig)
 		if err != nil {
 			return launcher.ModelProfile{}, err
 		}
@@ -347,48 +351,37 @@ func resolveModelProfile(model, modelsConfig string) (launcher.ModelProfile, err
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
-	repositoryID, err := client.NormalizeRepository(model)
+	families, err := embeddedModelFamilies()
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
-	bases, err := embeddedModelBases()
+	repository, err := client.Resolve(ctx, model)
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
-	repository, err := client.Resolve(context.Background(), repositoryID)
-	if err != nil {
-		return launcher.ModelProfile{}, err
-	}
-	manifest, _, err := client.FetchManifest(context.Background(), repository)
-	if err != nil {
-		return launcher.ModelProfile{}, err
-	}
-	kind, err := launcher.RepositoryManifestKind(manifest, repository.ID+"/lil.yaml")
+	profile, kind, err := hubModelProfile(ctx, client, families, repository)
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
 	if kind == "draft" {
 		return launcher.ModelProfile{}, fmt.Errorf("%s is a DFlash draft checkpoint and cannot be launched as a serving model", repository.ID)
 	}
-	return launcher.LoadRepositoryModelProfile(
-		bases, manifest, repository.ID, repository.Revision,
-		repository.ID+"/lil.yaml",
-	)
+	return profile, nil
 }
 
-func validateHubDraftProfile(profile launcher.ModelProfile) error {
-	if profile.DFlash2Model == nil {
-		return fmt.Errorf("model %q does not define a DFlash2 repository", profile.Name)
+func validateHubDraftProfile(ctx context.Context, profile launcher.ModelProfile) error {
+	if profile.Speculators.DFlash == nil {
+		return fmt.Errorf("model %q does not define a DFlash draft repository", profile.Name)
 	}
 	client, err := hfhub.DefaultClient(modelRepositoryOwner)
 	if err != nil {
 		return err
 	}
-	repository, err := client.Resolve(context.Background(), *profile.DFlash2Model)
+	repository, err := client.Resolve(ctx, profile.Speculators.DFlash.Model)
 	if err != nil {
 		return err
 	}
-	manifest, _, err := client.FetchManifest(context.Background(), repository)
+	manifest, _, err := client.FetchManifest(ctx, repository)
 	if err != nil {
 		return err
 	}
@@ -409,23 +402,7 @@ func validateHubDraftProfile(profile launcher.ModelProfile) error {
 	)
 }
 
-func resolveExistingCLIPath(path string) string {
-	if path == "~" {
-		if home, err := os.UserHomeDir(); err == nil {
-			path = home
-		}
-	} else if strings.HasPrefix(path, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
-		}
-	}
-	if abs, err := filepath.Abs(path); err == nil {
-		return abs
-	}
-	return filepath.Clean(path)
-}
-
-func buildSpec(fs *pflag.FlagSet, values launchFlags) (launcher.LaunchSpec, error) {
+func buildSpec(ctx context.Context, fs *pflag.FlagSet, values launchFlags) (launcher.LaunchSpec, error) {
 	args := fs.Args()
 	dash := fs.ArgsLenAtDash()
 	if (dash < 0 && len(args) != 1) || (dash >= 0 && dash != 1) {
@@ -435,7 +412,7 @@ func buildSpec(fs *pflag.FlagSet, values launchFlags) (launcher.LaunchSpec, erro
 	if dash >= 0 {
 		extraArgs = append(extraArgs, args[dash:]...)
 	}
-	profile, err := resolveModelProfile(args[0], values.modelsConfig)
+	profile, err := resolveModelProfile(ctx, args[0], values.modelsConfig)
 	if err != nil {
 		return launcher.LaunchSpec{}, err
 	}
@@ -460,8 +437,8 @@ func buildSpec(fs *pflag.FlagSet, values launchFlags) (launcher.LaunchSpec, erro
 	if err != nil {
 		return launcher.LaunchSpec{}, err
 	}
-	if values.modelsConfig == "" && spec.Metadata["speculator"] == "dflash2" {
-		if err := validateHubDraftProfile(profile); err != nil {
+	if values.modelsConfig == "" && spec.Metadata["speculator"] == "dflash" && spec.Metadata["speculative_tokens"] != 0 {
+		if err := validateHubDraftProfile(ctx, profile); err != nil {
 			return launcher.LaunchSpec{}, err
 		}
 	}
@@ -487,39 +464,32 @@ func newFlagSet(command string) *pflag.FlagSet {
 	return fs
 }
 
-func listCommand(args []string) error {
+func listCommand(ctx context.Context, args []string) error {
 	fs := newFlagSet("list")
-	modelsConfig := fs.String("models-config", "", "model profile YAML path")
+	modelsConfig := fs.String("models-config", "", "directory of <model>/lil.yaml manifests")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("list takes no positional arguments")
 	}
-	profiles, err := loadProfiles(*modelsConfig)
+	profiles, err := loadProfiles(ctx, *modelsConfig)
 	if err != nil {
 		return err
 	}
 	return printList(profiles)
 }
 
-func defaultTP(policy launcher.TopologyLaunchPolicy) string {
-	if policy.DefaultTPAll {
-		return "all"
-	}
-	return strconv.Itoa(policy.DefaultTPSize)
-}
-
-func checksPass(spec launcher.LaunchSpec) bool {
+func printChecks(results []launcher.CheckResult) bool {
 	passed := true
-	for _, result := range launcher.RunChecks(spec, true) {
+	for _, result := range results {
 		fmt.Printf("%-4s  %s: %s\n", result.Status, result.Name, result.Detail)
 		passed = passed && !result.Failed()
 	}
 	return passed
 }
 
-func renderCommand(args []string) error {
+func renderCommand(ctx context.Context, args []string) error {
 	fs := newFlagSet("render")
 	var values launchFlags
 	configureLaunchFlags(fs, &values, false)
@@ -530,7 +500,7 @@ func renderCommand(args []string) error {
 	if *format != "shell" && *format != "json" {
 		return fmt.Errorf("--format must be shell or json")
 	}
-	spec, err := buildSpec(fs, values)
+	spec, err := buildSpec(ctx, fs, values)
 	if err != nil {
 		return err
 	}
@@ -546,52 +516,55 @@ func renderCommand(args []string) error {
 	return nil
 }
 
-func checkCommand(args []string) (bool, error) {
+func checkCommand(ctx context.Context, args []string) (bool, error) {
 	fs := newFlagSet("check")
 	var values launchFlags
 	configureLaunchFlags(fs, &values, false)
 	if err := fs.Parse(args); err != nil {
 		return false, err
 	}
-	spec, err := buildSpec(fs, values)
+	spec, err := buildSpec(ctx, fs, values)
 	if err != nil {
 		return false, err
 	}
-	return checksPass(spec), nil
+	return printChecks(launcher.RunChecks(ctx, spec, true)), nil
 }
 
-func runCommand(args []string) (int, error) {
+func runCommand(ctx context.Context, args []string) (int, error) {
 	fs := newFlagSet("run")
 	var values launchFlags
 	configureLaunchFlags(fs, &values, true)
 	if err := fs.Parse(args); err != nil {
 		return 2, err
 	}
-	spec, err := buildSpec(fs, values)
+	spec, err := buildSpec(ctx, fs, values)
 	if err != nil {
 		return 2, err
 	}
-	if spec.Topology.Spark != nil && spec.SyncCode && !launcher.SyncSparkSources(spec) {
+	if spec.Topology.Spark != nil && spec.SyncCode && !launcher.SyncSparkSources(ctx, spec) {
 		return 1, nil
 	}
 	if spec.Topology.Spark != nil && spec.SyncModel {
-		if err := launcher.SyncSparkModel(spec); err != nil {
+		if err := launcher.SyncSparkModel(ctx, spec); err != nil {
 			return 1, err
 		}
 	}
 	if spec.Topology.Spark != nil {
-		if err := launcher.PrepareSparkProfilerDirectories(spec); err != nil {
+		if err := launcher.PrepareSparkProfilerDirectories(ctx, spec); err != nil {
 			return 1, err
 		}
 	}
-	if !checksPass(spec) {
+	if !printChecks(launcher.RunChecks(ctx, spec, true)) {
 		return 1, nil
 	}
-	if err := launcher.SyncHuggingFaceCache(spec); err != nil {
+	if err := launcher.SyncHuggingFaceCache(ctx, spec); err != nil {
 		return 1, err
 	}
 	if spec.Topology.Spark != nil {
-		return launcher.RunSparkCluster(spec), nil
+		if len(spec.DownloadRepositories) > 0 && !printChecks(launcher.RecheckSparkNodes(ctx, spec)) {
+			return 1, nil
+		}
+		return launcher.RunSparkCluster(ctx, spec), nil
 	}
 	if outputDir, ok := launcher.ProfilerOutputDir(spec.VLLMArgv); ok {
 		if err := os.MkdirAll(outputDir, 0o755); err != nil {
@@ -634,16 +607,17 @@ type clusterFlags struct {
 	modelsConfig string
 	tp           int
 	port         int
+	rank         int
 	follow       bool
 	tail         int
 	timeout      time.Duration
 }
 
-func clusterTarget(fs *pflag.FlagSet, values clusterFlags) (launcher.SparkTarget, error) {
+func clusterTarget(ctx context.Context, fs *pflag.FlagSet, values clusterFlags) (launcher.SparkTarget, error) {
 	if fs.NArg() != 1 {
 		return launcher.SparkTarget{}, fmt.Errorf("cluster operation requires exactly one MODEL")
 	}
-	profile, err := resolveModelProfile(fs.Arg(0), values.modelsConfig)
+	profile, err := resolveModelProfile(ctx, fs.Arg(0), values.modelsConfig)
 	if err != nil {
 		return launcher.SparkTarget{}, err
 	}
@@ -662,7 +636,7 @@ func clusterTarget(fs *pflag.FlagSet, values clusterFlags) (launcher.SparkTarget
 	)
 }
 
-func clusterCommand(args []string) (int, error) {
+func clusterCommand(ctx context.Context, args []string) (int, error) {
 	if len(args) == 0 {
 		return 2, fmt.Errorf("cluster action is required: status, logs, wait, stop, profile-start, or profile-stop")
 	}
@@ -671,9 +645,9 @@ func clusterCommand(args []string) (int, error) {
 
 Actions:
   status         Show container state on every selected rank.
-  logs           Show or follow logs from the head container.
+  logs           Show or follow logs from one rank (default: the head).
   wait           Wait for every rank and the head API to become ready.
-  stop           Stop containers on every selected rank.
+  stop           Stop containers on every selected rank and remove them.
   profile-start  Start the configured vLLM profiler.
   profile-stop   Stop the configured vLLM profiler.`)
 		return 0, nil
@@ -688,11 +662,12 @@ Actions:
 	fs.SetOutput(os.Stderr)
 	values := clusterFlags{}
 	fs.StringVar(&values.config, "config", "", "discovered Spark topology name or YAML path")
-	fs.StringVar(&values.modelsConfig, "models-config", "", "model profile YAML directory or file")
+	fs.StringVar(&values.modelsConfig, "models-config", "", "directory of <model>/lil.yaml manifests")
 	fs.IntVar(&values.tp, "tp", 0, "tensor parallel size used by the cluster")
 	fs.IntVar(&values.port, "port", 0, "head API port")
-	fs.BoolVarP(&values.follow, "follow", "f", false, "follow head container logs")
-	fs.IntVar(&values.tail, "tail", 120, "head log lines to show")
+	fs.IntVar(&values.rank, "rank", 0, "rank whose logs to show")
+	fs.BoolVarP(&values.follow, "follow", "f", false, "follow container logs")
+	fs.IntVar(&values.tail, "tail", 120, "log lines to show")
 	fs.DurationVar(&values.timeout, "timeout", defaultTimeout, "readiness or profile request timeout")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: lil cluster %s MODEL [options]\n", action)
@@ -701,44 +676,44 @@ Actions:
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2, err
 	}
-	if action != "logs" && (fs.Changed("follow") || fs.Changed("tail")) {
-		return 2, fmt.Errorf("--follow and --tail are valid only for cluster logs")
+	if action != "logs" && (fs.Changed("follow") || fs.Changed("tail") || fs.Changed("rank")) {
+		return 2, fmt.Errorf("--follow, --tail, and --rank are valid only for cluster logs")
 	}
 	if action != "wait" && action != "profile-start" && action != "profile-stop" && fs.Changed("timeout") {
 		return 2, fmt.Errorf("--timeout is valid only for cluster wait or profiler control")
 	}
-	target, err := clusterTarget(fs, values)
+	target, err := clusterTarget(ctx, fs, values)
 	if err != nil {
 		return 2, err
 	}
 	switch action {
 	case "status":
-		statuses, err := launcher.InspectSparkTarget(target)
+		statuses, err := launcher.InspectSparkTarget(ctx, target)
 		if err != nil {
 			return 1, err
 		}
 		printClusterStatus(target, statuses)
 		return 0, nil
 	case "logs":
-		return launcher.RunSparkLogs(target, values.follow, values.tail)
+		return launcher.RunSparkLogs(ctx, target, values.rank, values.follow, values.tail)
 	case "wait":
-		if err := launcher.WaitSparkReady(target, values.timeout); err != nil {
+		if err := launcher.WaitSparkReady(ctx, target, values.timeout); err != nil {
 			return 1, err
 		}
 		fmt.Printf("ready  http://%s:%d\n", target.Nodes[0].SSHHost, target.Port)
 		return 0, nil
 	case "stop":
-		if err := launcher.StopSparkTarget(target); err != nil {
+		if err := launcher.StopSparkTarget(ctx, target); err != nil {
 			return 1, err
 		}
 		return 0, nil
 	case "profile-start":
-		if err := launcher.SparkProfileRequest(target, true, values.timeout); err != nil {
+		if err := launcher.SparkProfileRequest(ctx, target, true, values.timeout); err != nil {
 			return 1, err
 		}
 		return 0, nil
 	case "profile-stop":
-		if err := launcher.SparkProfileRequest(target, false, values.timeout); err != nil {
+		if err := launcher.SparkProfileRequest(ctx, target, false, values.timeout); err != nil {
 			return 1, err
 		}
 		return 0, nil
@@ -773,7 +748,7 @@ func commandErrorStatus(err error) (int, error) {
 	return 0, nil
 }
 
-func execute(args []string) (int, error) {
+func execute(ctx context.Context, args []string) (int, error) {
 	if len(args) == 0 {
 		usage()
 		return 2, errors.New("a command is required")
@@ -788,13 +763,13 @@ func execute(args []string) (int, error) {
 	}
 	switch args[0] {
 	case "list":
-		return commandErrorStatus(listCommand(args[1:]))
+		return commandErrorStatus(listCommand(ctx, args[1:]))
 	case "discover":
-		return commandErrorStatus(discoverCommand(args[1:]))
+		return commandErrorStatus(discoverCommand(ctx, args[1:]))
 	case "render":
-		return commandErrorStatus(renderCommand(args[1:]))
+		return commandErrorStatus(renderCommand(ctx, args[1:]))
 	case "check":
-		passed, err := checkCommand(args[1:])
+		passed, err := checkCommand(ctx, args[1:])
 		if errors.Is(err, pflag.ErrHelp) {
 			return 0, nil
 		}
@@ -806,13 +781,13 @@ func execute(args []string) (int, error) {
 		}
 		return 0, nil
 	case "run":
-		status, err := runCommand(args[1:])
+		status, err := runCommand(ctx, args[1:])
 		if errors.Is(err, pflag.ErrHelp) {
 			return 0, nil
 		}
 		return status, err
 	case "cluster":
-		status, err := clusterCommand(args[1:])
+		status, err := clusterCommand(ctx, args[1:])
 		if errors.Is(err, pflag.ErrHelp) {
 			return 0, nil
 		}
@@ -823,8 +798,22 @@ func execute(args []string) (int, error) {
 	}
 }
 
+// interruptContext cancels on the first interrupt and restores default
+// signal handling afterwards, so a second interrupt terminates the process
+// even while cleanup is in progress.
+func interruptContext() (context.Context, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+	return ctx, stop
+}
+
 func main() {
-	status, err := execute(os.Args[1:])
+	ctx, stop := interruptContext()
+	defer stop()
+	status, err := execute(ctx, os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "lil:", err)
 	}

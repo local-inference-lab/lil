@@ -68,15 +68,6 @@ func PrettyShellArgv(argv []string) string {
 	return strings.Join(lines, " \\\n  ")
 }
 
-var sshOptions = []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=5"}
-
-func RemoteArgv(host string, argv []string) []string {
-	result := []string{"ssh"}
-	result = append(result, sshOptions...)
-	result = append(result, host, shellJoin(argv))
-	return result
-}
-
 func ShellRender(spec LaunchSpec) string {
 	if spec.Topology.Spark != nil {
 		commands := make([]string, 0, len(spec.SparkNodes))
@@ -115,6 +106,9 @@ type sparkNodeJSON struct {
 
 type launchSpecJSON struct {
 	Model                string            `json:"model"`
+	Repository           string            `json:"repository"`
+	ManifestCommit       string            `json:"manifest_commit"`
+	Family               string            `json:"family"`
 	ModelSource          string            `json:"model_source"`
 	CheckpointPath       *string           `json:"checkpoint_path"`
 	ServedModelName      string            `json:"served_model_name"`
@@ -156,7 +150,9 @@ func JSONRender(spec LaunchSpec) ([]byte, error) {
 		unset = []string{}
 	}
 	return json.MarshalIndent(launchSpecJSON{
-		Model: spec.Model.Name, ModelSource: spec.ModelSource,
+		Model: spec.Model.Name, Repository: spec.Model.Model,
+		ManifestCommit: spec.Model.ManifestCommit, Family: spec.Model.Family,
+		ModelSource:    spec.ModelSource,
 		CheckpointPath: spec.CheckpointPath, ServedModelName: spec.ServedModelName,
 		Topology: spec.Topology.Name(), TopologyKind: spec.Topology.Kind,
 		TensorParallelSize: spec.TPSize, DeviceIDs: deviceIDs,

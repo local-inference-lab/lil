@@ -1,28 +1,26 @@
 schema_version: 1
 kind: model
-extends:
-  - glm
-  - full-graph
+family: glm
 description: GLM-5.3 with NVFP4 routed experts, MXFP8 projections, and an NVFP4 MTP expert layer
-weight_bytes: 435548900560
-served_model_name: GLM-5.3
-expected_architectures:
-  - GlmMoeDsaForCausalLM
-trust_remote_code: true
-async_scheduling: true
-generation_config: vllm
-hf_overrides: {}
-long_prefill_token_threshold: 2048
-default_speculator: mtp
-mtp_tokens: 3
-mtp_attention_backend: B12X
-mtp_model: target
-mtp_draft_sample_method: probabilistic
-cuda_device_max_connections: 32
-launch:
-  local:
-    default_tp_size: 8
-  spark_rdma:
-    default_tp_size: all
-quantization: modelopt_mixed
-mtp_moe_quantization: nvfp4
+serving:
+  served_model_name: GLM-5.3
+  trust_remote_code: true
+  async_scheduling: true
+  generation_config: vllm
+  long_prefill_token_threshold: 2048
+kernels:
+  quantization: modelopt_mixed
+speculators:
+  default: mtp
+  mtp:
+    tokens: 3
+    moe_quantization: nvfp4
+    attention: B12X
+    draft_sample_method: probabilistic
+    model: target
+compilation:
+  cudagraph_mode: FULL_AND_PIECEWISE
+  custom_ops:
+    - all
+environment:
+  CUDA_DEVICE_MAX_CONNECTIONS: "32"

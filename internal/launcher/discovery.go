@@ -4,6 +4,7 @@
 package launcher
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -38,6 +39,7 @@ type LocalDiscoveryOptions struct {
 	Host                 string
 	Port                 int
 	GPUMemoryUtilization float64
+	DefaultTP            string
 	RepoRoot             string
 	Python               string
 	B12XRoot             string
@@ -49,6 +51,7 @@ type SparkDiscoveryOptions struct {
 	Host                  string
 	Port                  int
 	GPUMemoryUtilization  float64
+	DefaultTP             string
 	RepoRoot              string
 	Python                string
 	B12XRoot              string
@@ -190,9 +193,9 @@ func gpuProbeEnvironment() []string {
 	return environmentList(environment)
 }
 
-func runGPUProbe(python, directory string) ([]gpuObservation, error) {
+func runGPUProbe(ctx context.Context, python, directory string) ([]gpuObservation, error) {
 	output, status, err := runCommand(
-		30*time.Second, directory, gpuProbeEnvironment(),
+		ctx, 30*time.Second, directory, gpuProbeEnvironment(),
 		[]string{python, "-c", gpuRuntimeProbe},
 	)
 	if err != nil {
@@ -307,7 +310,13 @@ func parseNVIDIATopology(data []byte, deviceIDs []int) [][]int {
 	return pools
 }
 
-func DiscoverLocalTopology(options LocalDiscoveryOptions) (Topology, error) {
+func DiscoverLocalTopology(ctx context.Context, options LocalDiscoveryOptions) (Topology, error) {
+	if options.DefaultTP == "" {
+		options.DefaultTP = DefaultTPFit
+	}
+	if _, err := resolveDefaultTP(options.DefaultTP, "discovery"); err != nil {
+		return Topology{}, err
+	}
 	if options.Port == 0 {
 		options.Port = 8000
 	}
@@ -349,7 +358,7 @@ func DiscoverLocalTopology(options LocalDiscoveryOptions) (Topology, error) {
 	if err != nil {
 		return Topology{}, err
 	}
-	gpus, err := runGPUProbe(python, repoRoot)
+	gpus, err := runGPUProbe(ctx, python, repoRoot)
 	if err != nil {
 		return Topology{}, err
 	}
@@ -362,7 +371,7 @@ func DiscoverLocalTopology(options LocalDiscoveryOptions) (Topology, error) {
 		deviceIDs[index] = gpu.ID
 	}
 	topoOutput, status, commandErr := runCommand(
-		10*time.Second, "", nil, []string{"nvidia-smi", "topo", "-m"},
+		ctx, 10*time.Second, "", nil, []string{"nvidia-smi", "topo", "-m"},
 	)
 	devicePools := [][]int{append([]int(nil), deviceIDs...)}
 	if commandErr == nil && status == 0 {
@@ -370,12 +379,13 @@ func DiscoverLocalTopology(options LocalDiscoveryOptions) (Topology, error) {
 	}
 	return Topology{
 		Kind: "local", GPUMemoryUtilization: options.GPUMemoryUtilization,
+		DefaultTP: options.DefaultTP,
 		Local: &LocalTopology{
 			Name: options.Name, Host: options.Host, Port: options.Port,
 			DeviceMemoryBytes: minimumGPUMemory(gpus),
 			RepoRoot:          repoRoot, Python: python, B12XRoot: b12xRoot,
 			CUDAHome: cudaHome, CuteDSLArch: cuteDSLArch(major, minor),
-			DevicePools: devicePools,
+			DevicePools: devicePools, Environment: DefaultLocalEnvironment(),
 		},
 	}, nil
 }
@@ -531,8 +541,8 @@ func bytesCompare(left, right []byte) int {
 	return 0
 }
 
-func remoteOutput(host string, argv []string, timeout time.Duration, description string) ([]byte, error) {
-	output, status, err := remoteRun(host, argv, timeout)
+func remoteOutput(ctx context.Context, host string, argv []string, timeout time.Duration, description string) ([]byte, error) {
+	output, status, err := remoteRun(ctx, host, argv, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: %w", host, description, err)
 	}
@@ -542,16 +552,16 @@ func remoteOutput(host string, argv []string, timeout time.Duration, description
 	return output, nil
 }
 
-func remotePathCheck(host, path, mode string) error {
-	if _, err := remoteOutput(host, []string{"test", mode, path}, 10*time.Second, "path check"); err != nil {
+func remotePathCheck(ctx context.Context, host, path, mode string) error {
+	if _, err := remoteOutput(ctx, host, []string{"test", mode, path}, 10*time.Second, "path check"); err != nil {
 		return fmt.Errorf("required remote path is unavailable: %s: %w", path, err)
 	}
 	return nil
 }
 
-func remoteGPUProbe(host, python string, deviceID int) ([]gpuObservation, error) {
+func remoteGPUProbe(ctx context.Context, host, python string, deviceID int) ([]gpuObservation, error) {
 	output, err := remoteOutput(
-		host,
+		ctx, host,
 		[]string{"env", "CUDA_VISIBLE_DEVICES=" + strconv.Itoa(deviceID), python, "-c", gpuRuntimeProbe},
 		30*time.Second,
 		"GPU runtime probe",
@@ -562,7 +572,7 @@ func remoteGPUProbe(host, python string, deviceID int) ([]gpuObservation, error)
 	return parseGPUObservations(output)
 }
 
-func inferRemoteCUDAHome(hosts []string, explicit string) (string, error) {
+func inferRemoteCUDAHome(ctx context.Context, hosts []string, explicit string) (string, error) {
 	candidates := []string{explicit}
 	if explicit == "" {
 		candidates = []string{"/opt/cuda", "/usr/local/cuda"}
@@ -571,7 +581,7 @@ func inferRemoteCUDAHome(hosts []string, explicit string) (string, error) {
 	for _, candidate := range candidates {
 		present := true
 		for _, host := range hosts {
-			if remotePathCheck(host, filepath.Join(candidate, "bin", "ptxas"), "-x") != nil {
+			if remotePathCheck(ctx, host, filepath.Join(candidate, "bin", "ptxas"), "-x") != nil {
 				present = false
 				break
 			}
@@ -589,10 +599,10 @@ func inferRemoteCUDAHome(hosts []string, explicit string) (string, error) {
 	return available[0], nil
 }
 
-func commonRemoteImage(hosts []string, explicit string) (string, error) {
+func commonRemoteImage(ctx context.Context, hosts []string, explicit string) (string, error) {
 	if explicit != "" {
 		for _, host := range hosts {
-			if _, err := remoteOutput(host, []string{"docker", "image", "inspect", explicit}, 15*time.Second, "Docker image check"); err != nil {
+			if _, err := remoteOutput(ctx, host, []string{"docker", "image", "inspect", explicit}, 15*time.Second, "Docker image check"); err != nil {
 				return "", err
 			}
 		}
@@ -601,7 +611,7 @@ func commonRemoteImage(hosts []string, explicit string) (string, error) {
 	var common map[string]bool
 	for _, host := range hosts {
 		output, err := remoteOutput(
-			host,
+			ctx, host,
 			[]string{"docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"},
 			15*time.Second,
 			"Docker image inventory",
@@ -639,12 +649,12 @@ func commonRemoteImage(hosts []string, explicit string) (string, error) {
 	return images[0], nil
 }
 
-func discoverRoCEGIDIndex(nodes []SparkNode, runtimePython string) (int, error) {
+func discoverRoCEGIDIndex(ctx context.Context, nodes []SparkNode, runtimePython string) (int, error) {
 	var common map[int]bool
 	for _, node := range nodes {
 		hcas, _ := json.Marshal(node.RDMAInterfaces)
 		output, err := remoteOutput(
-			node.SSHHost,
+			ctx, node.SSHHost,
 			[]string{runtimePython, "-c", roceGIDProbe, string(hcas)},
 			10*time.Second,
 			"RoCE GID probe",
@@ -681,7 +691,13 @@ func discoverRoCEGIDIndex(nodes []SparkNode, runtimePython string) (int, error) 
 	return indices[0], nil
 }
 
-func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
+func DiscoverSparkTopology(ctx context.Context, options SparkDiscoveryOptions) (Topology, error) {
+	if options.DefaultTP == "" {
+		options.DefaultTP = DefaultTPAll
+	}
+	if _, err := resolveDefaultTP(options.DefaultTP, "discovery"); err != nil {
+		return Topology{}, err
+	}
 	if len(options.Nodes) == 0 {
 		return Topology{}, fmt.Errorf("Spark/RDMA discovery requires at least one --node")
 	}
@@ -749,7 +765,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 			return Topology{}, err
 		}
 	}
-	firstHomeData, err := remoteOutput(options.Nodes[0], []string{"pwd"}, 10*time.Second, "home-directory probe")
+	firstHomeData, err := remoteOutput(ctx, options.Nodes[0], []string{"pwd"}, 10*time.Second, "home-directory probe")
 	if err != nil {
 		return Topology{}, err
 	}
@@ -769,7 +785,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 	if options.RuntimeB12XRoot == "" {
 		options.RuntimeB12XRoot = filepath.Join(remoteHome, "projects", "b12x")
 	}
-	options.CUDAHome, err = inferRemoteCUDAHome(options.Nodes, options.CUDAHome)
+	options.CUDAHome, err = inferRemoteCUDAHome(ctx, options.Nodes, options.CUDAHome)
 	if err != nil {
 		return Topology{}, err
 	}
@@ -786,15 +802,15 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 	allGPUs := []gpuObservation{}
 	for _, host := range options.Nodes {
 		for _, path := range remotePaths {
-			if err := remotePathCheck(host, path.path, path.mode); err != nil {
+			if err := remotePathCheck(ctx, host, path.path, path.mode); err != nil {
 				return Topology{}, err
 			}
 		}
-		ipData, err := remoteOutput(host, []string{"ip", "-j", "-4", "addr", "show"}, 10*time.Second, "network inventory")
+		ipData, err := remoteOutput(ctx, host, []string{"ip", "-j", "-4", "addr", "show"}, 10*time.Second, "network inventory")
 		if err != nil {
 			return Topology{}, err
 		}
-		rdmaData, err := remoteOutput(host, []string{"rdma", "-j", "link", "show"}, 10*time.Second, "RDMA inventory")
+		rdmaData, err := remoteOutput(ctx, host, []string{"rdma", "-j", "link", "show"}, 10*time.Second, "RDMA inventory")
 		if err != nil {
 			return Topology{}, err
 		}
@@ -802,7 +818,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 		if err != nil {
 			return Topology{}, err
 		}
-		gpus, err := remoteGPUProbe(host, options.RuntimePython, options.DeviceID)
+		gpus, err := remoteGPUProbe(ctx, host, options.RuntimePython, options.DeviceID)
 		if err != nil {
 			return Topology{}, err
 		}
@@ -815,7 +831,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 	if err != nil {
 		return Topology{}, err
 	}
-	gidIndex, err := discoverRoCEGIDIndex(nodes, options.RuntimePython)
+	gidIndex, err := discoverRoCEGIDIndex(ctx, nodes, options.RuntimePython)
 	if err != nil {
 		return Topology{}, err
 	}
@@ -827,7 +843,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 	if err != nil {
 		return Topology{}, err
 	}
-	image, err := commonRemoteImage(options.Nodes, options.Image)
+	image, err := commonRemoteImage(ctx, options.Nodes, options.Image)
 	if err != nil {
 		return Topology{}, err
 	}
@@ -842,7 +858,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 	for _, candidate := range cacheCandidates {
 		present := true
 		for _, host := range options.Nodes {
-			if remotePathCheck(host, candidate.source, "-d") != nil {
+			if remotePathCheck(ctx, host, candidate.source, "-d") != nil {
 				present = false
 				break
 			}
@@ -858,6 +874,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 	}
 	return Topology{
 		Kind: "spark_rdma", GPUMemoryUtilization: options.GPUMemoryUtilization,
+		DefaultTP: options.DefaultTP,
 		Spark: &SparkRDMATopology{
 			Name: options.Name, Host: options.Host, Port: options.Port,
 			DeviceMemoryBytes: deviceMemory,
@@ -883,6 +900,7 @@ func DiscoverSparkTopology(options SparkDiscoveryOptions) (Topology, error) {
 			NCCLIBGIDIndex:        gidIndex,
 			NCCLIBMergeNICs:       mergeNICs,
 			DeviceID:              options.DeviceID,
+			Environment:           DefaultSparkEnvironment(),
 		},
 	}, nil
 }

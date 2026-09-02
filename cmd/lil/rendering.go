@@ -53,34 +53,75 @@ func formatGiB(bytes int64) string {
 	return fmt.Sprintf("%.1f GiB", float64(bytes)/float64(int64(1)<<30))
 }
 
+// topologyFit describes how a model lands on one discovered topology.
+func topologyFit(profile launcher.ModelProfile, item topologyFile) string {
+	if item.Err != nil || profile.Facts == nil {
+		return ""
+	}
+	topology := item.Topology
+	if len(profile.Requires.Arch) > 0 && !contains(profile.Requires.Arch, topology.CuteDSLArch()) {
+		return fmt.Sprintf("%s: requires %s", topology.Name(), strings.Join(profile.Requires.Arch, "/"))
+	}
+	tp, err := launcher.DefaultTPSize(profile.Facts, topology, topology.MemoryUtilization())
+	if err != nil {
+		return fmt.Sprintf("%s: does not fit", topology.Name())
+	}
+	return fmt.Sprintf("%s: TP %d", topology.Name(), tp)
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func profileSummary(profile launcher.ModelProfile) string {
+	parts := []string{}
+	if profile.Facts != nil {
+		parts = append(parts, formatGiB(profile.Facts.WeightBytes)+" stored")
+	}
+	if profile.Family != "" {
+		parts = append(parts, "family "+profile.Family)
+	}
+	parts = append(parts, "speculator "+profile.Speculators.Default)
+	return strings.Join(parts, "  ·  ")
+}
+
 func renderList(profiles map[string]launcher.ModelProfile) string {
+	topologies, topologyErr := discoveredTopologies()
 	var sections []string
 	names := launcher.SortedProfileNames(profiles)
 	modelCards := make([]string, 0, len(names))
 	for _, name := range names {
 		profile := profiles[name]
-		metadata := fmt.Sprintf(
-			"defaults  ·  local TP %s  ·  Spark/RDMA TP %s",
-			defaultTP(profile.Launch.Local),
-			defaultTP(profile.Launch.SparkRDMA),
-		)
-		body := strings.Join([]string{
+		lines := []string{
 			nameStyle.Render(name),
 			wrapListText(profile.Description),
-			metadataStyle.Render(wrapListText(metadata)),
-		}, "\n")
-		modelCards = append(modelCards, cardStyle.Render(body))
+			metadataStyle.Render(wrapListText(profileSummary(profile))),
+		}
+		fits := []string{}
+		for _, item := range topologies {
+			if fit := topologyFit(profile, item); fit != "" {
+				fits = append(fits, fit)
+			}
+		}
+		if len(fits) > 0 {
+			lines = append(lines, metadataStyle.Render(wrapListText("defaults  ·  "+strings.Join(fits, "  ·  "))))
+		}
+		modelCards = append(modelCards, cardStyle.Render(strings.Join(lines, "\n")))
 	}
 	sections = append(sections,
 		headingStyle.Render(fmt.Sprintf("Models  %d", len(names)))+"\n\n"+
 			strings.Join(modelCards, "\n\n"),
 	)
 
-	topologies, err := discoveredTopologies()
-	if err != nil {
+	if topologyErr != nil {
 		sections = append(sections,
 			headingStyle.Render("Topologies")+"\n\n"+
-				cardStyle.Render(metadataStyle.Render("unavailable: ")+err.Error()),
+				cardStyle.Render(metadataStyle.Render("unavailable: ")+topologyErr.Error()),
 		)
 		return strings.Join(sections, "\n\n") + "\n"
 	}
@@ -95,27 +136,9 @@ func renderList(profiles map[string]launcher.ModelProfile) string {
 			topologyCards = append(topologyCards, cardStyle.Render(body))
 			continue
 		}
-		topology := item.Topology
-		var summary string
-		if topology.Local != nil {
-			devices := 0
-			for _, pool := range topology.Local.DevicePools {
-				devices = max(devices, len(pool))
-			}
-			summary = fmt.Sprintf(
-				"local  ·  TP 1–%d  ·  %s/GPU  ·  %s",
-				devices, formatGiB(topology.DeviceMemoryBytes()), topology.CuteDSLArch(),
-			)
-		} else {
-			summary = fmt.Sprintf(
-				"Spark/RDMA  ·  TP 1–%d  ·  %s/rank  ·  %s",
-				len(topology.Spark.Nodes), formatGiB(topology.DeviceMemoryBytes()),
-				topology.CuteDSLArch(),
-			)
-		}
 		body := strings.Join([]string{
-			nameStyle.Render(topology.Name()),
-			metadataStyle.Render(wrapListText(summary)),
+			nameStyle.Render(item.Topology.Name()),
+			metadataStyle.Render(wrapListText(topologySummary(item.Topology))),
 			wrapListPath(displayPath(item.Path)),
 		}, "\n")
 		topologyCards = append(topologyCards, cardStyle.Render(body))
@@ -136,32 +159,29 @@ func renderList(profiles map[string]launcher.ModelProfile) string {
 	return strings.Join(sections, "\n\n") + "\n"
 }
 
+func topologySummary(topology launcher.Topology) string {
+	kind := "local"
+	unit := "GPU"
+	if topology.Spark != nil {
+		kind = "Spark/RDMA"
+		unit = "rank"
+	}
+	return fmt.Sprintf(
+		"%s  ·  TP 1–%d  ·  %s/%s  ·  %s  ·  default TP %s",
+		kind, topology.MaxTPSize(), formatGiB(topology.DeviceMemoryBytes()), unit,
+		topology.CuteDSLArch(), topology.DefaultTP,
+	)
+}
+
 func printList(profiles map[string]launcher.ModelProfile) error {
 	_, err := lipgloss.Fprint(os.Stdout, renderList(profiles))
 	return err
 }
 
 func printDiscoveryResult(topology launcher.Topology, path string) {
-	var capacity string
-	if topology.Local != nil {
-		devices := 0
-		for _, pool := range topology.Local.DevicePools {
-			devices = max(devices, len(pool))
-		}
-		capacity = fmt.Sprintf(
-			"local  ·  TP 1–%d  ·  %s/GPU  ·  %s",
-			devices, formatGiB(topology.DeviceMemoryBytes()), topology.CuteDSLArch(),
-		)
-	} else {
-		capacity = fmt.Sprintf(
-			"Spark/RDMA  ·  TP 1–%d  ·  %s/rank  ·  %s",
-			len(topology.Spark.Nodes), formatGiB(topology.DeviceMemoryBytes()),
-			topology.CuteDSLArch(),
-		)
-	}
 	body := strings.Join([]string{
 		nameStyle.Render(topology.Name()),
-		metadataStyle.Render(capacity),
+		metadataStyle.Render(topologySummary(topology)),
 		displayPath(path),
 	}, "\n")
 	_, _ = lipgloss.Fprint(

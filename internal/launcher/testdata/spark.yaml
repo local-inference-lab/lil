@@ -7,6 +7,7 @@ name: spark-test
 host: 0.0.0.0
 port: 8000
 gpu_memory_utilization: 0.95
+default_tp: all
 device_memory_bytes: 115964116992
 repo_root: /home/luke/projects/vllm-hh-rebase
 python: .venv/bin/python
@@ -41,3 +42,24 @@ nccl_debug: INFO
 nccl_ib_gid_index: 3
 nccl_ib_merge_nics: true
 device_id: 0
+environment:
+  INSTANTTENSOR_BACKEND: BUFFERED
+  INSTANTTENSOR_BUFFER_SIZE: "1342177280"
+  INSTANTTENSOR_CONCURRENCY: "1"
+  INSTANTTENSOR_IO_DEPTH: "3"
+  NCCL_IB_DISABLE: "0"
+  NCCL_IB_SUBNET_AWARE_ROUTING: "1"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_NET_PLUGIN: none
+  OMP_NUM_THREADS: "16"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  SAFETENSORS_FAST_GPU: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "0"
+  VLLM_PLUGINS: ""
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_STANDALONE_COMPILE: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_WORKER_MULTIPROC_METHOD: spawn

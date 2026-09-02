@@ -20,19 +20,21 @@ type topologyMeta struct {
 }
 
 type localTopologyYAML struct {
-	SchemaVersion        int      `yaml:"schema_version"`
-	Kind                 string   `yaml:"kind"`
-	Name                 string   `yaml:"name"`
-	Host                 string   `yaml:"host"`
-	Port                 int      `yaml:"port"`
-	GPUMemoryUtilization *float64 `yaml:"gpu_memory_utilization,omitempty"`
-	DeviceMemoryBytes    int64    `yaml:"device_memory_bytes"`
-	RepoRoot             string   `yaml:"repo_root"`
-	Python               string   `yaml:"python"`
-	B12XRoot             string   `yaml:"b12x_root"`
-	CUDAHome             string   `yaml:"cuda_home"`
-	CuteDSLArch          string   `yaml:"cute_dsl_arch"`
-	DevicePools          [][]int  `yaml:"device_pools"`
+	SchemaVersion        int               `yaml:"schema_version"`
+	Kind                 string            `yaml:"kind"`
+	Name                 string            `yaml:"name"`
+	Host                 string            `yaml:"host"`
+	Port                 int               `yaml:"port"`
+	GPUMemoryUtilization *float64          `yaml:"gpu_memory_utilization,omitempty"`
+	DefaultTP            string            `yaml:"default_tp,omitempty"`
+	DeviceMemoryBytes    int64             `yaml:"device_memory_bytes"`
+	RepoRoot             string            `yaml:"repo_root"`
+	Python               string            `yaml:"python"`
+	B12XRoot             string            `yaml:"b12x_root"`
+	CUDAHome             string            `yaml:"cuda_home"`
+	CuteDSLArch          string            `yaml:"cute_dsl_arch"`
+	DevicePools          [][]int           `yaml:"device_pools"`
+	Environment          map[string]string `yaml:"environment"`
 }
 
 type sparkNodeYAML struct {
@@ -48,36 +50,38 @@ type cacheMountYAML struct {
 }
 
 type sparkTopologyYAML struct {
-	SchemaVersion         int              `yaml:"schema_version"`
-	Kind                  string           `yaml:"kind"`
-	Name                  string           `yaml:"name"`
-	Host                  string           `yaml:"host"`
-	Port                  int              `yaml:"port"`
-	GPUMemoryUtilization  *float64         `yaml:"gpu_memory_utilization,omitempty"`
-	DeviceMemoryBytes     int64            `yaml:"device_memory_bytes"`
-	RepoRoot              string           `yaml:"repo_root"`
-	Python                string           `yaml:"python"`
-	RuntimeRepoRoot       string           `yaml:"runtime_repo_root"`
-	RuntimePython         string           `yaml:"runtime_python"`
-	VLLMBin               string           `yaml:"vllm_bin"`
-	B12XRoot              string           `yaml:"b12x_root"`
-	RuntimeB12XRoot       string           `yaml:"runtime_b12x_root"`
-	Nodes                 []sparkNodeYAML  `yaml:"nodes"`
-	MasterPort            int              `yaml:"master_port"`
-	Image                 string           `yaml:"image"`
-	ContainerNamePrefix   string           `yaml:"container_name_prefix"`
-	ContainerMemoryGB     int              `yaml:"container_memory_gb"`
-	ContainerMemorySwapGB int              `yaml:"container_memory_swap_gb"`
-	ContainerShmGB        int              `yaml:"container_shm_gb"`
-	ContainerPidsLimit    int              `yaml:"container_pids_limit"`
-	ContainerNofileLimit  int              `yaml:"container_nofile_limit"`
-	CacheMounts           []cacheMountYAML `yaml:"cache_mounts"`
-	CUDAHome              string           `yaml:"cuda_home"`
-	CuteDSLArch           string           `yaml:"cute_dsl_arch"`
-	NCCLDebug             string           `yaml:"nccl_debug"`
-	NCCLIBGIDIndex        int              `yaml:"nccl_ib_gid_index"`
-	NCCLIBMergeNICs       bool             `yaml:"nccl_ib_merge_nics"`
-	DeviceID              int              `yaml:"device_id"`
+	SchemaVersion         int               `yaml:"schema_version"`
+	Kind                  string            `yaml:"kind"`
+	Name                  string            `yaml:"name"`
+	Host                  string            `yaml:"host"`
+	Port                  int               `yaml:"port"`
+	GPUMemoryUtilization  *float64          `yaml:"gpu_memory_utilization,omitempty"`
+	DefaultTP             string            `yaml:"default_tp,omitempty"`
+	DeviceMemoryBytes     int64             `yaml:"device_memory_bytes"`
+	RepoRoot              string            `yaml:"repo_root"`
+	Python                string            `yaml:"python"`
+	RuntimeRepoRoot       string            `yaml:"runtime_repo_root"`
+	RuntimePython         string            `yaml:"runtime_python"`
+	VLLMBin               string            `yaml:"vllm_bin"`
+	B12XRoot              string            `yaml:"b12x_root"`
+	RuntimeB12XRoot       string            `yaml:"runtime_b12x_root"`
+	Nodes                 []sparkNodeYAML   `yaml:"nodes"`
+	MasterPort            int               `yaml:"master_port"`
+	Image                 string            `yaml:"image"`
+	ContainerNamePrefix   string            `yaml:"container_name_prefix"`
+	ContainerMemoryGB     int               `yaml:"container_memory_gb"`
+	ContainerMemorySwapGB int               `yaml:"container_memory_swap_gb"`
+	ContainerShmGB        int               `yaml:"container_shm_gb"`
+	ContainerPidsLimit    int               `yaml:"container_pids_limit"`
+	ContainerNofileLimit  int               `yaml:"container_nofile_limit"`
+	CacheMounts           []cacheMountYAML  `yaml:"cache_mounts"`
+	CUDAHome              string            `yaml:"cuda_home"`
+	CuteDSLArch           string            `yaml:"cute_dsl_arch"`
+	NCCLDebug             string            `yaml:"nccl_debug"`
+	NCCLIBGIDIndex        int               `yaml:"nccl_ib_gid_index"`
+	NCCLIBMergeNICs       bool              `yaml:"nccl_ib_merge_nics"`
+	DeviceID              int               `yaml:"device_id"`
+	Environment           map[string]string `yaml:"environment"`
 }
 
 func strictYAML(data []byte, target any) error {
@@ -155,6 +159,35 @@ func resolveGPUMemoryUtilization(value *float64, context string) (float64, error
 	return *value, nil
 }
 
+func resolveDefaultTP(value, context string) (string, error) {
+	switch value {
+	case "":
+		return DefaultTPFit, nil
+	case DefaultTPFit, DefaultTPAll:
+		return value, nil
+	default:
+		return "", fmt.Errorf("%s.default_tp must be fit or all", context)
+	}
+}
+
+func validateTopologyEnvironment(environment map[string]string, context string) error {
+	if environment == nil {
+		return fmt.Errorf(
+			"%s.environment is required; run lil discover again or add the host tuning block",
+			context,
+		)
+	}
+	for name := range environment {
+		if !environmentName.MatchString(name) {
+			return fmt.Errorf("%s.environment contains an invalid variable name: %q", context, name)
+		}
+		if derivedEnvironment[name] {
+			return fmt.Errorf("%s.environment.%s is derived by the launcher and cannot be configured", context, name)
+		}
+	}
+	return nil
+}
+
 func LoadTopology(data []byte, label, baseDir string) (Topology, error) {
 	var meta topologyMeta
 	if err := yaml.Unmarshal(data, &meta); err != nil {
@@ -180,6 +213,10 @@ func LoadTopology(data []byte, label, baseDir string) (Topology, error) {
 
 func MarshalTopology(topology Topology) ([]byte, error) {
 	var value any
+	defaultTP, err := resolveDefaultTP(topology.DefaultTP, "topology")
+	if err != nil {
+		return nil, err
+	}
 	switch topology.Kind {
 	case "local":
 		if topology.Local == nil || topology.Spark != nil {
@@ -194,6 +231,7 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 			Host:                 local.Host,
 			Port:                 local.Port,
 			GPUMemoryUtilization: &utilization,
+			DefaultTP:            defaultTP,
 			DeviceMemoryBytes:    local.DeviceMemoryBytes,
 			RepoRoot:             local.RepoRoot,
 			Python:               local.Python,
@@ -201,6 +239,7 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 			CUDAHome:             local.CUDAHome,
 			CuteDSLArch:          local.CuteDSLArch,
 			DevicePools:          local.DevicePools,
+			Environment:          emptyIfNil(local.Environment),
 		}
 	case "spark_rdma":
 		if topology.Spark == nil || topology.Local != nil {
@@ -227,6 +266,7 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 			Host:                  spark.Host,
 			Port:                  spark.Port,
 			GPUMemoryUtilization:  &utilization,
+			DefaultTP:             defaultTP,
 			DeviceMemoryBytes:     spark.DeviceMemoryBytes,
 			RepoRoot:              spark.RepoRoot,
 			Python:                spark.Python,
@@ -251,6 +291,7 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 			NCCLIBGIDIndex:        spark.NCCLIBGIDIndex,
 			NCCLIBMergeNICs:       spark.NCCLIBMergeNICs,
 			DeviceID:              spark.DeviceID,
+			Environment:           emptyIfNil(spark.Environment),
 		}
 	default:
 		return nil, fmt.Errorf("unsupported topology kind: %q", topology.Kind)
@@ -272,6 +313,13 @@ func MarshalTopology(topology Topology) ([]byte, error) {
 	header := "# SPDX-License-Identifier: Apache-2.0\n" +
 		"# SPDX-FileCopyrightText: Copyright contributors to the lil project\n\n"
 	return append([]byte(header), encoded.Bytes()...), nil
+}
+
+func emptyIfNil(environment map[string]string) map[string]string {
+	if environment == nil {
+		return map[string]string{}
+	}
+	return environment
 }
 
 func setSequenceItemsFlowStyle(node *yaml.Node, key string) {
@@ -306,6 +354,13 @@ func loadLocalTopology(data []byte, label, baseDir string) (Topology, error) {
 	}
 	utilization, err := resolveGPUMemoryUtilization(raw.GPUMemoryUtilization, label)
 	if err != nil {
+		return Topology{}, err
+	}
+	defaultTP, err := resolveDefaultTP(raw.DefaultTP, label)
+	if err != nil {
+		return Topology{}, err
+	}
+	if err := validateTopologyEnvironment(raw.Environment, label); err != nil {
 		return Topology{}, err
 	}
 	if len(raw.DevicePools) == 0 {
@@ -345,13 +400,13 @@ func loadLocalTopology(data []byte, label, baseDir string) (Topology, error) {
 		return Topology{}, err
 	}
 	return Topology{
-		Kind: "local", GPUMemoryUtilization: utilization,
+		Kind: "local", GPUMemoryUtilization: utilization, DefaultTP: defaultTP,
 		Local: &LocalTopology{
 			Name: raw.Name, Host: raw.Host, Port: raw.Port,
 			DeviceMemoryBytes: raw.DeviceMemoryBytes,
 			RepoRoot:          repoRoot, Python: python, B12XRoot: b12xRoot,
 			CUDAHome: cudaHome, CuteDSLArch: raw.CuteDSLArch,
-			DevicePools: raw.DevicePools,
+			DevicePools: raw.DevicePools, Environment: raw.Environment,
 		},
 	}, nil
 }
@@ -378,6 +433,13 @@ func loadSparkTopology(data []byte, label, baseDir string) (Topology, error) {
 	}
 	utilization, err := resolveGPUMemoryUtilization(raw.GPUMemoryUtilization, label)
 	if err != nil {
+		return Topology{}, err
+	}
+	defaultTP, err := resolveDefaultTP(raw.DefaultTP, label)
+	if err != nil {
+		return Topology{}, err
+	}
+	if err := validateTopologyEnvironment(raw.Environment, label); err != nil {
 		return Topology{}, err
 	}
 	if raw.ContainerMemoryGB <= 0 || raw.ContainerMemorySwapGB < raw.ContainerMemoryGB {
@@ -476,7 +538,7 @@ func loadSparkTopology(data []byte, label, baseDir string) (Topology, error) {
 		return Topology{}, err
 	}
 	return Topology{
-		Kind: "spark_rdma", GPUMemoryUtilization: utilization,
+		Kind: "spark_rdma", GPUMemoryUtilization: utilization, DefaultTP: defaultTP,
 		Spark: &SparkRDMATopology{
 			Name: raw.Name, Host: raw.Host, Port: raw.Port,
 			DeviceMemoryBytes: raw.DeviceMemoryBytes,
@@ -495,6 +557,7 @@ func loadSparkTopology(data []byte, label, baseDir string) (Topology, error) {
 			NCCLIBGIDIndex:  raw.NCCLIBGIDIndex,
 			NCCLIBMergeNICs: raw.NCCLIBMergeNICs,
 			DeviceID:        raw.DeviceID,
+			Environment:     raw.Environment,
 		},
 	}, nil
 }

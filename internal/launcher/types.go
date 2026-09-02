@@ -3,9 +3,18 @@
 
 package launcher
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 const DefaultGPUMemoryUtilization = 0.95
+
+// Default tensor-parallel selection policies stored in topology YAML.
+const (
+	DefaultTPFit = "fit"
+	DefaultTPAll = "all"
+)
 
 type LocalTopology struct {
 	Name              string
@@ -18,21 +27,26 @@ type LocalTopology struct {
 	CUDAHome          string
 	CuteDSLArch       string
 	DevicePools       [][]int
+	Environment       map[string]string
+}
+
+func (t *LocalTopology) MaxDevices() int {
+	devices := 0
+	for _, pool := range t.DevicePools {
+		devices = max(devices, len(pool))
+	}
+	return devices
 }
 
 func (t *LocalTopology) SelectDevices(tpSize int) ([]int, error) {
-	available := 0
 	for _, pool := range t.DevicePools {
-		if len(pool) > available {
-			available = len(pool)
-		}
 		if len(pool) >= tpSize {
 			return append([]int(nil), pool[:tpSize]...), nil
 		}
 	}
 	return nil, fmt.Errorf(
 		"topology %q has at most %d local GPUs, but TP=%d was requested",
-		t.Name, available, tpSize,
+		t.Name, t.MaxDevices(), tpSize,
 	)
 }
 
@@ -76,11 +90,13 @@ type SparkRDMATopology struct {
 	NCCLIBGIDIndex        int
 	NCCLIBMergeNICs       bool
 	DeviceID              int
+	Environment           map[string]string
 }
 
 type Topology struct {
 	Kind                 string
 	GPUMemoryUtilization float64
+	DefaultTP            string
 	Local                *LocalTopology
 	Spark                *SparkRDMATopology
 }
@@ -155,6 +171,22 @@ func (t Topology) CuteDSLArch() string {
 	return t.Spark.CuteDSLArch
 }
 
+// Environment returns the host tuning recorded by discovery for this topology.
+func (t Topology) Environment() map[string]string {
+	if t.Local != nil {
+		return t.Local.Environment
+	}
+	return t.Spark.Environment
+}
+
+// MaxTPSize is the largest tensor-parallel size the topology can host.
+func (t Topology) MaxTPSize() int {
+	if t.Local != nil {
+		return t.Local.MaxDevices()
+	}
+	return len(t.Spark.Nodes)
+}
+
 type Capacity struct {
 	GPUMemoryUtilization *float64 `json:"gpu_memory_utilization"`
 	KVCacheMemoryBytes   *string  `json:"kv_cache_memory_bytes"`
@@ -163,83 +195,122 @@ type Capacity struct {
 	MaxNumBatchedTokens  int      `json:"max_num_batched_tokens"`
 }
 
+// LaunchLayer is one partial contribution to the resolved launch settings.
+// Capacity and Compilation are raw mappings so that layers merge recursively
+// before the resolved capacity is validated.
+type LaunchLayer struct {
+	Capacity    map[string]any
+	Compilation map[string]any
+	Environment map[string]string
+}
+
+// OverrideCondition selects the launches an override applies to. Zero-valued
+// fields are unconstrained; set fields must all match.
+type OverrideCondition struct {
+	Kind string
+	Arch string
+	TP   int
+}
+
+func (c OverrideCondition) Matches(kind, arch string, tpSize int) bool {
+	return (c.Kind == "" || c.Kind == kind) &&
+		(c.Arch == "" || c.Arch == arch) &&
+		(c.TP == 0 || c.TP == tpSize)
+}
+
+type LaunchOverride struct {
+	When  OverrideCondition
+	Layer LaunchLayer
+}
+
 type LaunchSettings struct {
 	Capacity          Capacity
 	CompilationConfig map[string]any
 	Environment       map[string]string
 }
 
-type TopologyLaunchPolicy struct {
-	DefaultTPAll  bool
-	DefaultTPSize int
-	Defaults      LaunchSettings
-	TP            map[int]LaunchSettings
+type MultimodalPolicy struct {
+	EncoderTPMode    *string
+	ProcessorCacheGB *float64
+	LimitPerPrompt   map[string]int
 }
 
-func (p TopologyLaunchPolicy) Resolve(tpSize int) LaunchSettings {
-	if settings, ok := p.TP[tpSize]; ok {
-		return settings
-	}
-	return p.Defaults
+type ServingPolicy struct {
+	ServedModelName           string
+	TrustRemoteCode           bool
+	ReasoningParser           string
+	ToolCallParser            string
+	AutoToolChoice            bool
+	GenerationConfig          *string
+	HFOverrides               map[string]any
+	AsyncScheduling           bool
+	PrefixCaching             bool
+	ChunkedPrefill            bool
+	LongPrefillTokenThreshold *int
+	Multimodal                *MultimodalPolicy
 }
 
-type LaunchPolicy struct {
-	Local     TopologyLaunchPolicy
-	SparkRDMA TopologyLaunchPolicy
+type KernelPolicy struct {
+	DType              string
+	Quantization       *string
+	Attention          *string
+	Linear             string
+	MoE                string
+	GDNDecode          *string
+	BlockSize          *int
+	MambaCacheMode     *string
+	FlashinferAutotune bool
+	LoadFormat         string
+	LoaderExtraConfig  map[string]any
 }
 
-func (p LaunchPolicy) Topology(kind string) (TopologyLaunchPolicy, error) {
-	switch kind {
-	case "local":
-		return p.Local, nil
-	case "spark_rdma":
-		return p.SparkRDMA, nil
-	default:
-		return TopologyLaunchPolicy{}, fmt.Errorf("unsupported topology kind: %q", kind)
-	}
+type MTPPolicy struct {
+	Tokens            int
+	MoEQuantization   string
+	Attention         *string
+	DraftSampleMethod *string
+	WeightsInTarget   bool
+}
+
+type DFlashPolicy struct {
+	Tokens int
+	Model  string
+}
+
+type SpeculatorPolicy struct {
+	Default string
+	MTP     *MTPPolicy
+	DFlash  *DFlashPolicy
+}
+
+type Requirements struct {
+	Arch []string
+}
+
+// CheckpointFacts are read from the checkpoint itself: config.json plus the
+// stored weight size. They are never declared by a manifest.
+type CheckpointFacts struct {
+	Source            string
+	Architectures     []string
+	AttentionHeads    int
+	WeightBytes       int64
+	WeightBytesSource string
+	Config            map[string]any
 }
 
 type ModelProfile struct {
-	Name                      string
-	Description               string
-	Model                     string
-	ManifestCommit            string
-	ServedModelName           string
-	ExpectedArchitectures     []string
-	AttentionHeads            int
-	WeightBytes               int64
-	Launch                    LaunchPolicy
-	Quantization              *string
-	LoadFormat                string
-	DType                     string
-	BlockSize                 *int
-	AttentionBackend          *string
-	LinearBackend             string
-	MoEBackend                string
-	ReasoningParser           string
-	ToolCallParser            string
-	TrustRemoteCode           bool
-	MambaCacheMode            *string
-	AsyncScheduling           bool
-	DisableFlashinferAutotune bool
-	GDNDecodeKernel           *string
-	ModelLoaderExtraConfig    map[string]any
-	MMEncoderTPMode           *string
-	MMProcessorCacheGB        *float64
-	LimitMMPerPrompt          map[string]int
-	GenerationConfig          *string
-	HFOverrides               map[string]any
-	HFOverridesSet            bool
-	LongPrefillTokenThreshold *int
-	DefaultSpeculator         string
-	MTPTokens                 int
-	DFlash2Tokens             *int
-	DFlash2Model              *string
-	MTPMoEQuantization        string
-	MTPAttentionBackend       *string
-	MTPModel                  *string
-	MTPDraftSampleMethod      *string
-	CUDADeviceMaxConnections  *int
+	Name           string
+	Description    string
+	Model          string
+	ManifestCommit string
+	Family         string
+	Serving        ServingPolicy
+	Kernels        KernelPolicy
+	Speculators    SpeculatorPolicy
+	Base           LaunchLayer
+	Overrides      []LaunchOverride
+	Requires       Requirements
+	Facts          *CheckpointFacts
 }
 
 type ProfilerOptions struct {
@@ -345,3 +416,12 @@ type CheckResult struct {
 }
 
 func (r CheckResult) Failed() bool { return r.Status == "FAIL" }
+
+func sortedMapKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}

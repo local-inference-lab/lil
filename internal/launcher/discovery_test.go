@@ -5,6 +5,7 @@ package launcher
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -46,20 +47,24 @@ func TestSelectSparkNetworksUsesFirstCommonSubnetAndAllCommonHCAs(t *testing.T) 
 	}
 }
 
-func TestMarshalTopologyRoundTrips(t *testing.T) {
+func TestMarshalTopologyRoundTripsWithRecordedTuning(t *testing.T) {
 	topology := Topology{
-		Kind: "local", GPUMemoryUtilization: 0.91,
+		Kind: "local", GPUMemoryUtilization: 0.91, DefaultTP: DefaultTPFit,
 		Local: &LocalTopology{
 			Name: "pulsar", Host: "0.0.0.0", Port: 8000,
 			DeviceMemoryBytes: 1024,
 			RepoRoot:          "/srv/vllm", Python: "/srv/vllm/.venv/bin/python",
 			B12XRoot: "/srv/b12x", CUDAHome: "/opt/cuda",
 			CuteDSLArch: "sm_120a", DevicePools: [][]int{{0, 1}},
+			Environment: DefaultLocalEnvironment(),
 		},
 	}
 	data, err := MarshalTopology(topology)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "default_tp: fit") || !strings.Contains(string(data), "VLLM_PCIE_ALLREDUCE_BACKEND: b12x") {
+		t.Fatalf("marshalled topology lacks tuning:\n%s", data)
 	}
 	loaded, err := LoadTopology(data, "generated.yaml", ".")
 	if err != nil {
@@ -67,5 +72,20 @@ func TestMarshalTopologyRoundTrips(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded, topology) {
 		t.Fatalf("round trip: got %+v, want %+v", loaded, topology)
+	}
+}
+
+func TestDefaultEnvironmentsNeverContainDerivedNames(t *testing.T) {
+	for kind, environment := range map[string]map[string]string{
+		"local": DefaultLocalEnvironment(), "spark": DefaultSparkEnvironment(),
+	} {
+		for name := range environment {
+			if derivedEnvironment[name] {
+				t.Errorf("%s default environment sets derived variable %s", kind, name)
+			}
+		}
+	}
+	if DefaultLocalEnvironment()["NCCL_IB_DISABLE"] != "1" || DefaultSparkEnvironment()["NCCL_IB_DISABLE"] != "0" {
+		t.Fatal("InfiniBand policy must differ between local and Spark defaults")
 	}
 }

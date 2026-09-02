@@ -106,6 +106,8 @@ func jsonInteger(value any) (int64, bool) {
 		return integer, float64(integer) == number
 	case int64:
 		return number, true
+	case int:
+		return int64(number), true
 	case json.Number:
 		value, err := number.Int64()
 		return value, err == nil
@@ -186,9 +188,14 @@ func loadConfig(modelPath string) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot inspect %s: %w", path, err)
 	}
+	return ParseCheckpointConfig(data, path)
+}
+
+// ParseCheckpointConfig decodes a checkpoint config.json document.
+func ParseCheckpointConfig(data []byte, label string) (map[string]any, error) {
 	var config map[string]any
 	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("cannot inspect %s: %w", path, err)
+		return nil, fmt.Errorf("cannot parse %s: %w", label, err)
 	}
 	return config, nil
 }
@@ -198,6 +205,54 @@ func modelConfig(config map[string]any) map[string]any {
 		return text
 	}
 	return config
+}
+
+// FactsFromConfig derives checkpoint facts from a parsed config.json and a
+// stored weight size measured elsewhere.
+func FactsFromConfig(config map[string]any, weightBytes int64, weightBytesSource, source string) (*CheckpointFacts, error) {
+	rawArchitectures, ok := config["architectures"].([]any)
+	if !ok || len(rawArchitectures) == 0 {
+		return nil, fmt.Errorf("%s: config.json does not list architectures", source)
+	}
+	architectures := make([]string, 0, len(rawArchitectures))
+	for _, raw := range rawArchitectures {
+		value, ok := raw.(string)
+		if !ok || value == "" {
+			return nil, fmt.Errorf("%s: config.json architectures must be strings", source)
+		}
+		architectures = append(architectures, value)
+	}
+	heads, ok := jsonInteger(modelConfig(config)["num_attention_heads"])
+	if !ok || heads <= 0 {
+		return nil, fmt.Errorf("%s: config.json does not declare num_attention_heads", source)
+	}
+	if weightBytes <= 0 {
+		return nil, fmt.Errorf("%s: stored weight size is unknown", source)
+	}
+	return &CheckpointFacts{
+		Source: source, Architectures: architectures, AttentionHeads: int(heads),
+		WeightBytes: weightBytes, WeightBytesSource: weightBytesSource, Config: config,
+	}, nil
+}
+
+// LoadCheckpointFacts reads facts from a checkpoint directory. A directory
+// holding only config.json and a safetensors index is accepted, which lets a
+// metadata-only mirror of a repository stand in for the checkpoint.
+func LoadCheckpointFacts(modelPath string) (*CheckpointFacts, error) {
+	config, err := loadConfig(modelPath)
+	if err != nil {
+		return nil, err
+	}
+	memory, err := CheckpointMemoryInfo(modelPath, false)
+	if err != nil {
+		return nil, err
+	}
+	if memory == nil {
+		return nil, fmt.Errorf(
+			"%s has no model.safetensors.index.json or safetensors shards to size", modelPath,
+		)
+	}
+	return FactsFromConfig(config, memory.TotalBytes, memory.Source, modelPath)
 }
 
 func mtpLayerIndices(config map[string]any) map[int64]bool {
@@ -292,11 +347,9 @@ func unquantizedMTPDecision(config map[string]any, defaultDType string) (MTPMoEB
 	return MTPMoEBackendDecision{"bf16", "triton", []string{fmt.Sprintf("no quantized MTP expert target; dtype=%v", dtype)}}, nil
 }
 
-func ResolveMTPMoEBackend(modelPath, defaultDType string) (MTPMoEBackendDecision, error) {
-	config, err := loadConfig(modelPath)
-	if err != nil {
-		return MTPMoEBackendDecision{}, err
-	}
+// MTPMoEBackendFromConfig decides the MTP expert kernel backend from the
+// quantization metadata of a parsed config.json.
+func MTPMoEBackendFromConfig(config map[string]any, defaultDType string) (MTPMoEBackendDecision, error) {
 	quantizationConfig, ok := config["quantization_config"].(map[string]any)
 	if !ok {
 		return unquantizedMTPDecision(config, defaultDType)
@@ -367,4 +420,13 @@ func ResolveMTPMoEBackend(modelPath, defaultDType string) (MTPMoEBackendDecision
 	}
 	sort.Strings(evidence)
 	return MTPMoEBackendDecision{quantization, backendDecision.Backend, evidence}, nil
+}
+
+// ResolveMTPMoEBackend decides the MTP expert backend from a checkpoint directory.
+func ResolveMTPMoEBackend(modelPath, defaultDType string) (MTPMoEBackendDecision, error) {
+	config, err := loadConfig(modelPath)
+	if err != nil {
+		return MTPMoEBackendDecision{}, err
+	}
+	return MTPMoEBackendFromConfig(config, defaultDType)
 }

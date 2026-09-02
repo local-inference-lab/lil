@@ -7,6 +7,7 @@ name: local-test
 host: 0.0.0.0
 port: 8000
 gpu_memory_utilization: 0.95
+default_tp: fit
 device_memory_bytes: 102641958912
 repo_root: /home/luke/projects/vllm-hh-rebase
 python: .venv/bin/python
@@ -17,3 +18,24 @@ device_pools:
   - [8, 9, 10, 11]
   - [0, 1, 2, 3, 4, 5, 6, 7]
   - [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+environment:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+  INSTANTTENSOR_BACKEND: BUFFERED
+  NCCL_IB_DISABLE: "1"
+  NCCL_P2P_LEVEL: SYS
+  NCCL_PROTO: LL,LL128,Simple
+  OMP_NUM_THREADS: "16"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  SAFETENSORS_FAST_GPU: "1"
+  VLLM_ENABLE_PCIE_ALLREDUCE: "1"
+  VLLM_PCIE_ALLREDUCE_BACKEND: b12x
+  VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: 64KB
+  VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: 84KB
+  VLLM_PLUGINS: ""
+  VLLM_USE_AOT_COMPILE: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_FLASHINFER_SAMPLER: "1"
+  VLLM_USE_MEGA_AOT_ARTIFACT: "1"
+  VLLM_USE_STANDALONE_COMPILE: "1"
+  VLLM_USE_V2_MODEL_RUNNER: "1"
+  VLLM_WORKER_MULTIPROC_METHOD: spawn

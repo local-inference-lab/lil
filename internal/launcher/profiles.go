@@ -4,7 +4,6 @@
 package launcher
 
 import (
-	"bytes"
 	"fmt"
 	"regexp"
 	"sort"
@@ -16,44 +15,24 @@ import (
 
 var hfModelID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 var hfCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-type profileYAML struct {
-	Description               string         `yaml:"description"`
-	Model                     string         `yaml:"model"`
-	ServedModelName           string         `yaml:"served_model_name"`
-	ExpectedArchitectures     []string       `yaml:"expected_architectures"`
-	AttentionHeads            int            `yaml:"attention_heads"`
-	WeightBytes               int64          `yaml:"weight_bytes"`
-	Quantization              *string        `yaml:"quantization"`
-	LoadFormat                string         `yaml:"load_format"`
-	DType                     string         `yaml:"dtype"`
-	BlockSize                 *int           `yaml:"block_size"`
-	AttentionBackend          *string        `yaml:"attention_backend"`
-	LinearBackend             string         `yaml:"linear_backend"`
-	MoEBackend                string         `yaml:"moe_backend"`
-	ReasoningParser           string         `yaml:"reasoning_parser"`
-	ToolCallParser            string         `yaml:"tool_call_parser"`
-	TrustRemoteCode           bool           `yaml:"trust_remote_code"`
-	MambaCacheMode            *string        `yaml:"mamba_cache_mode"`
-	AsyncScheduling           bool           `yaml:"async_scheduling"`
-	DisableFlashinferAutotune bool           `yaml:"disable_flashinfer_autotune"`
-	GDNDecodeKernel           *string        `yaml:"gdn_decode_kernel"`
-	ModelLoaderExtraConfig    map[string]any `yaml:"model_loader_extra_config"`
-	MMEncoderTPMode           *string        `yaml:"mm_encoder_tp_mode"`
-	MMProcessorCacheGB        *float64       `yaml:"mm_processor_cache_gb"`
-	LimitMMPerPrompt          map[string]int `yaml:"limit_mm_per_prompt"`
-	GenerationConfig          *string        `yaml:"generation_config"`
-	HFOverrides               map[string]any `yaml:"hf_overrides"`
-	LongPrefillTokenThreshold *int           `yaml:"long_prefill_token_threshold"`
-	DefaultSpeculator         string         `yaml:"default_speculator"`
-	MTPTokens                 *int           `yaml:"mtp_tokens"`
-	DFlash2Tokens             *int           `yaml:"dflash2_tokens"`
-	DFlash2Model              *string        `yaml:"dflash2_model"`
-	MTPMoEQuantization        string         `yaml:"mtp_moe_quantization"`
-	MTPAttentionBackend       *string        `yaml:"mtp_attention_backend"`
-	MTPModel                  *string        `yaml:"mtp_model"`
-	MTPDraftSampleMethod      *string        `yaml:"mtp_draft_sample_method"`
-	CUDADeviceMaxConnections  *int           `yaml:"cuda_device_max_connections"`
+// Launcher-wide defaults that any manifest section may override.
+const (
+	defaultDType      = "bfloat16"
+	defaultLinear     = "b12x"
+	defaultMoE        = "b12x"
+	defaultLoadFormat = "instanttensor"
+	defaultMTPTokens  = 3
+)
+
+var capacityKeys = []string{
+	"kv_cache_memory_bytes", "max_model_len", "max_num_seqs", "max_num_batched_tokens",
+}
+
+var manifestSections = []string{
+	"description", "serving", "kernels", "speculators", "capacity",
+	"compilation", "environment", "requires", "overrides",
 }
 
 func normalizeYAML(value any) (any, error) {
@@ -100,6 +79,18 @@ func normalizeYAML(value any) (any, error) {
 	default:
 		return value, nil
 	}
+}
+
+func parseYAMLDocument(data []byte, label string) (map[string]any, error) {
+	var loaded any
+	if err := yaml.Unmarshal(data, &loaded); err != nil {
+		return nil, fmt.Errorf("invalid YAML in %s: %w", label, err)
+	}
+	normalized, err := normalizeYAML(loaded)
+	if err != nil {
+		return nil, err
+	}
+	return mapping(normalized, label)
 }
 
 func mapping(value any, context string) (map[string]any, error) {
@@ -153,12 +144,11 @@ func cloneValue(value any) any {
 	}
 }
 
+// deepMerge overlays a mapping onto a base. Nested mappings merge; scalars,
+// lists, and explicit nulls replace the inherited value.
 func deepMerge(base, overlay map[string]any) map[string]any {
 	merged := cloneValue(base).(map[string]any)
 	for key, value := range overlay {
-		if key == "extends" {
-			continue
-		}
 		inherited, inheritedOK := merged[key].(map[string]any)
 		child, childOK := value.(map[string]any)
 		if inheritedOK && childOK {
@@ -170,95 +160,257 @@ func deepMerge(base, overlay map[string]any) map[string]any {
 	return merged
 }
 
-func parentNames(value any, context string) ([]string, error) {
-	if value == nil {
-		return nil, nil
+func schemaVersionOf(document map[string]any, label string) error {
+	version, ok := document["schema_version"].(int)
+	if !ok || version != schemaVersion {
+		return fmt.Errorf(
+			"%s.schema_version must be %d; got %v",
+			label, schemaVersion, document["schema_version"],
+		)
 	}
-	if parent, ok := value.(string); ok && parent != "" {
-		return []string{parent}, nil
-	}
-	items, ok := value.([]any)
-	if !ok || len(items) == 0 {
-		return nil, fmt.Errorf("%s must be a base name or non-empty list", context)
-	}
-	parents := make([]string, 0, len(items))
-	seen := map[string]bool{}
-	for _, item := range items {
-		parent, ok := item.(string)
-		if !ok || parent == "" {
-			return nil, fmt.Errorf("%s must be a base name or non-empty list", context)
-		}
-		if seen[parent] {
-			return nil, fmt.Errorf("%s contains duplicate parents", context)
-		}
-		seen[parent] = true
-		parents = append(parents, parent)
-	}
-	return parents, nil
+	return nil
 }
 
-func resolveProfileMaps(bases, models map[string]any, context string) (map[string]map[string]any, error) {
-	resolvedBases := map[string]map[string]any{}
-	visiting := []string{}
-	var resolveBase func(string) (map[string]any, error)
-	resolveBase = func(name string) (map[string]any, error) {
-		if resolved, ok := resolvedBases[name]; ok {
-			return resolved, nil
-		}
-		value, ok := bases[name]
-		if !ok {
-			return nil, fmt.Errorf("%s.bases has no base named %q", context, name)
-		}
-		for index, active := range visiting {
-			if active == name {
-				cycle := append(append([]string{}, visiting[index:]...), name)
-				return nil, fmt.Errorf("profile inheritance cycle: %s", strings.Join(cycle, " -> "))
-			}
-		}
-		visiting = append(visiting, name)
-		raw, err := mapping(value, context+".bases."+name)
+// LoadFamilies parses the embedded family bases document.
+func LoadFamilies(data []byte, label string) (map[string]map[string]any, error) {
+	document, err := parseYAMLDocument(data, label)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkKeys(document, label, []string{"schema_version"}, []string{"families"}); err != nil {
+		return nil, err
+	}
+	if err := schemaVersionOf(document, label); err != nil {
+		return nil, err
+	}
+	families := map[string]map[string]any{}
+	if raw, ok := document["families"]; ok && raw != nil {
+		table, err := mapping(raw, label+".families")
 		if err != nil {
 			return nil, err
 		}
-		parents, err := parentNames(raw["extends"], context+".bases."+name+".extends")
-		if err != nil {
-			return nil, err
-		}
-		merged := map[string]any{}
-		for _, parent := range parents {
-			resolved, err := resolveBase(parent)
+		for name, value := range table {
+			family, err := mapping(value, label+".families."+name)
 			if err != nil {
 				return nil, err
 			}
-			merged = deepMerge(merged, resolved)
+			if err := checkKeys(family, label+".families."+name, nil, append([]string{"family"}, manifestSections...)); err != nil {
+				return nil, err
+			}
+			families[name] = family
 		}
-		merged = deepMerge(merged, raw)
-		visiting = visiting[:len(visiting)-1]
-		resolvedBases[name] = merged
-		return merged, nil
 	}
+	return families, nil
+}
 
-	resolvedModels := map[string]map[string]any{}
-	for name, value := range models {
-		raw, err := mapping(value, context+".models."+name)
-		if err != nil {
-			return nil, err
+func resolveFamily(families map[string]map[string]any, name string, visiting []string) (map[string]any, error) {
+	for index, active := range visiting {
+		if active == name {
+			cycle := append(append([]string{}, visiting[index:]...), name)
+			return nil, fmt.Errorf("family inheritance cycle: %s", strings.Join(cycle, " -> "))
 		}
-		parents, err := parentNames(raw["extends"], context+".models."+name+".extends")
-		if err != nil {
-			return nil, err
-		}
-		merged := map[string]any{}
-		for _, parent := range parents {
-			resolved, err := resolveBase(parent)
-			if err != nil {
-				return nil, err
-			}
-			merged = deepMerge(merged, resolved)
-		}
-		resolvedModels[name] = deepMerge(merged, raw)
 	}
-	return resolvedModels, nil
+	raw, ok := families[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown model family %q", name)
+	}
+	resolved := map[string]any{}
+	if parent, exists := raw["family"]; exists && parent != nil {
+		parentName, ok := parent.(string)
+		if !ok || parentName == "" {
+			return nil, fmt.Errorf("family %q has an invalid parent", name)
+		}
+		var err error
+		resolved, err = resolveFamily(families, parentName, append(visiting, name))
+		if err != nil {
+			return nil, err
+		}
+	}
+	overlay := cloneValue(raw).(map[string]any)
+	delete(overlay, "family")
+	return deepMerge(resolved, overlay), nil
+}
+
+type section struct {
+	data    map[string]any
+	context string
+}
+
+func subsection(parent map[string]any, key, context string) (section, bool, error) {
+	raw, ok := parent[key]
+	if !ok || raw == nil {
+		return section{}, false, nil
+	}
+	data, err := mapping(raw, context+"."+key)
+	if err != nil {
+		return section{}, false, err
+	}
+	return section{data, context + "." + key}, true, nil
+}
+
+func (s section) present(key string) bool {
+	value, ok := s.data[key]
+	return ok && value != nil
+}
+
+func (s section) optionalString(key string) (*string, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	value, ok := s.data[key].(string)
+	if !ok || value == "" {
+		return nil, fmt.Errorf("%s.%s must be a non-empty string or null", s.context, key)
+	}
+	return &value, nil
+}
+
+func (s section) stringOr(key, fallback string) (string, error) {
+	value, err := s.optionalString(key)
+	if err != nil || value == nil {
+		return fallback, err
+	}
+	return *value, nil
+}
+
+func (s section) boolOr(key string, fallback bool) (bool, error) {
+	if !s.present(key) {
+		return fallback, nil
+	}
+	value, ok := s.data[key].(bool)
+	if !ok {
+		return false, fmt.Errorf("%s.%s must be a boolean", s.context, key)
+	}
+	return value, nil
+}
+
+func (s section) optionalPositiveInt(key string) (*int, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	value, ok := s.data[key].(int)
+	if !ok || value <= 0 {
+		return nil, fmt.Errorf("%s.%s must be a positive integer or null", s.context, key)
+	}
+	return &value, nil
+}
+
+func (s section) optionalNonNegativeInt(key string) (*int, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	value, ok := s.data[key].(int)
+	if !ok || value < 0 {
+		return nil, fmt.Errorf("%s.%s must be a non-negative integer or null", s.context, key)
+	}
+	return &value, nil
+}
+
+func (s section) optionalNonNegativeFloat(key string) (*float64, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	var value float64
+	switch typed := s.data[key].(type) {
+	case int:
+		value = float64(typed)
+	case float64:
+		value = typed
+	default:
+		return nil, fmt.Errorf("%s.%s must be a number or null", s.context, key)
+	}
+	if value < 0 {
+		return nil, fmt.Errorf("%s.%s must be non-negative", s.context, key)
+	}
+	return &value, nil
+}
+
+func (s section) optionalMapping(key string) (map[string]any, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	value, err := mapping(s.data[key], s.context+"."+key)
+	if err != nil {
+		return nil, err
+	}
+	return cloneValue(value).(map[string]any), nil
+}
+
+func (s section) optionalStringList(key string) ([]string, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	items, ok := s.data[key].([]any)
+	if !ok || len(items) == 0 {
+		return nil, fmt.Errorf("%s.%s must be a non-empty list of strings", s.context, key)
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		value, ok := item.(string)
+		if !ok || value == "" {
+			return nil, fmt.Errorf("%s.%s must be a non-empty list of strings", s.context, key)
+		}
+		result = append(result, value)
+	}
+	return result, nil
+}
+
+func parseEnvironmentMap(raw any, context string) (map[string]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	data, err := mapping(raw, context)
+	if err != nil {
+		return nil, err
+	}
+	environment := make(map[string]string, len(data))
+	for key, value := range data {
+		text, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s values must be strings; quote %s", context, key)
+		}
+		if !environmentName.MatchString(key) {
+			return nil, fmt.Errorf("%s contains an invalid variable name: %q", context, key)
+		}
+		if derivedEnvironment[key] {
+			return nil, fmt.Errorf("%s.%s is derived by the launcher and cannot be configured", context, key)
+		}
+		environment[key] = text
+	}
+	return environment, nil
+}
+
+func parseCapacityLayer(raw any, context string) (map[string]any, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	data, err := mapping(raw, context)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkKeys(data, context, nil, capacityKeys); err != nil {
+		return nil, err
+	}
+	return cloneValue(data).(map[string]any), nil
+}
+
+func parseLaunchLayer(data map[string]any, context string) (LaunchLayer, error) {
+	capacity, err := parseCapacityLayer(data["capacity"], context+".capacity")
+	if err != nil {
+		return LaunchLayer{}, err
+	}
+	var compilation map[string]any
+	if raw, ok := data["compilation"]; ok && raw != nil {
+		compilation, err = mapping(raw, context+".compilation")
+		if err != nil {
+			return LaunchLayer{}, err
+		}
+		compilation = cloneValue(compilation).(map[string]any)
+	}
+	environment, err := parseEnvironmentMap(data["environment"], context+".environment")
+	if err != nil {
+		return LaunchLayer{}, err
+	}
+	return LaunchLayer{Capacity: capacity, Compilation: compilation, Environment: environment}, nil
 }
 
 func parseCapacity(value any, context string) (Capacity, error) {
@@ -266,8 +418,7 @@ func parseCapacity(value any, context string) (Capacity, error) {
 	if err != nil {
 		return Capacity{}, err
 	}
-	keys := []string{"kv_cache_memory_bytes", "max_model_len", "max_num_seqs", "max_num_batched_tokens"}
-	if err := checkKeys(data, context, keys, nil); err != nil {
+	if err := checkKeys(data, context, capacityKeys, nil); err != nil {
 		return Capacity{}, err
 	}
 	var kvCache *string
@@ -293,354 +444,355 @@ func parseCapacity(value any, context string) (Capacity, error) {
 	return Capacity{nil, kvCache, maxModelLen, maxSeqs, maxTokens}, nil
 }
 
-func parseLaunchSettings(value any, context string) (LaunchSettings, error) {
-	data, err := mapping(value, context)
+func parseServing(data map[string]any, context string) (ServingPolicy, error) {
+	s, ok, err := subsection(data, "serving", context)
 	if err != nil {
-		return LaunchSettings{}, err
+		return ServingPolicy{}, err
 	}
-	if err := checkKeys(data, context, []string{"capacity", "compilation_config", "environment"}, nil); err != nil {
-		return LaunchSettings{}, err
+	if !ok {
+		return ServingPolicy{}, fmt.Errorf("%s.serving is required", context)
 	}
-	capacity, err := parseCapacity(data["capacity"], context+".capacity")
-	if err != nil {
-		return LaunchSettings{}, err
+	if err := checkKeys(s.data, s.context, []string{"served_model_name"}, []string{
+		"trust_remote_code", "reasoning_parser", "tool_call_parser", "auto_tool_choice",
+		"generation_config", "hf_overrides", "async_scheduling", "prefix_caching",
+		"chunked_prefill", "long_prefill_token_threshold", "multimodal",
+	}); err != nil {
+		return ServingPolicy{}, err
 	}
-	var compilation map[string]any
-	if data["compilation_config"] != nil {
-		compilation, err = mapping(data["compilation_config"], context+".compilation_config")
-		if err != nil {
-			return LaunchSettings{}, err
-		}
-		compilation = cloneValue(compilation).(map[string]any)
+	var policy ServingPolicy
+	if policy.ServedModelName, err = s.stringOr("served_model_name", ""); err != nil {
+		return policy, err
 	}
-	environmentRaw, err := mapping(data["environment"], context+".environment")
-	if err != nil {
-		return LaunchSettings{}, err
+	if policy.ServedModelName == "" {
+		return policy, fmt.Errorf("%s.served_model_name must be a non-empty string", s.context)
 	}
-	allowedEnvironment := map[string]bool{
-		"INSTANTTENSOR_BUFFER_SIZE": true, "INSTANTTENSOR_CHUNK_SIZE": true,
-		"INSTANTTENSOR_CONCURRENCY": true, "INSTANTTENSOR_IO_DEPTH": true,
-		"VLLM_PLE_CPU_OFFLOAD": true,
+	if policy.TrustRemoteCode, err = s.boolOr("trust_remote_code", false); err != nil {
+		return policy, err
 	}
-	environment := map[string]string{}
-	for key, raw := range environmentRaw {
-		value, ok := raw.(string)
-		if !ok {
-			return LaunchSettings{}, fmt.Errorf("%s.environment values must be strings", context)
-		}
-		if !allowedEnvironment[key] {
-			return LaunchSettings{}, fmt.Errorf("%s.environment contains unsupported key: %s", context, key)
-		}
-		environment[key] = value
+	if policy.ReasoningParser, err = s.stringOr("reasoning_parser", ""); err != nil {
+		return policy, err
 	}
-	return LaunchSettings{capacity, compilation, environment}, nil
-}
-
-func parseTopologyPolicy(value any, inherited map[string]any, context string) (TopologyLaunchPolicy, error) {
-	data, err := mapping(value, context)
-	if err != nil {
-		return TopologyLaunchPolicy{}, err
+	if policy.ToolCallParser, err = s.stringOr("tool_call_parser", ""); err != nil {
+		return policy, err
 	}
-	if err := checkKeys(data, context, []string{"default_tp_size"}, []string{"defaults", "tp"}); err != nil {
-		return TopologyLaunchPolicy{}, err
+	if policy.AutoToolChoice, err = s.boolOr("auto_tool_choice", policy.ToolCallParser != ""); err != nil {
+		return policy, err
 	}
-	policy := TopologyLaunchPolicy{TP: map[int]LaunchSettings{}}
-	switch value := data["default_tp_size"].(type) {
-	case string:
-		if value != "all" {
-			return policy, fmt.Errorf("%s.default_tp_size must be a positive integer or 'all'", context)
-		}
-		policy.DefaultTPAll = true
-	case int:
-		if value <= 0 {
-			return policy, fmt.Errorf("%s.default_tp_size must be a positive integer or 'all'", context)
-		}
-		policy.DefaultTPSize = value
-	default:
-		return policy, fmt.Errorf("%s.default_tp_size must be a positive integer or 'all'", context)
+	if policy.AutoToolChoice && policy.ToolCallParser == "" {
+		return policy, fmt.Errorf("%s.auto_tool_choice requires tool_call_parser", s.context)
 	}
-	defaultsOverlay := map[string]any{}
-	if value, ok := data["defaults"]; ok {
-		defaultsOverlay, err = mapping(value, context+".defaults")
-		if err != nil {
-			return policy, err
-		}
+	if policy.GenerationConfig, err = s.optionalString("generation_config"); err != nil {
+		return policy, err
 	}
-	defaults := deepMerge(inherited, defaultsOverlay)
-	policy.Defaults, err = parseLaunchSettings(defaults, context+".resolved_defaults")
+	if policy.HFOverrides, err = s.optionalMapping("hf_overrides"); err != nil {
+		return policy, err
+	}
+	if policy.AsyncScheduling, err = s.boolOr("async_scheduling", false); err != nil {
+		return policy, err
+	}
+	if policy.PrefixCaching, err = s.boolOr("prefix_caching", true); err != nil {
+		return policy, err
+	}
+	if policy.ChunkedPrefill, err = s.boolOr("chunked_prefill", true); err != nil {
+		return policy, err
+	}
+	if policy.LongPrefillTokenThreshold, err = s.optionalPositiveInt("long_prefill_token_threshold"); err != nil {
+		return policy, err
+	}
+	multimodal, ok, err := subsection(s.data, "multimodal", s.context)
 	if err != nil {
 		return policy, err
 	}
-	if rawTP, ok := data["tp"]; ok {
-		tpData, err := mapping(rawTP, context+".tp")
-		if err != nil {
+	if ok {
+		if err := checkKeys(multimodal.data, multimodal.context, nil, []string{
+			"encoder_tp_mode", "processor_cache_gb", "limit_per_prompt",
+		}); err != nil {
 			return policy, err
 		}
-		for rawSize, rawOverrides := range tpData {
-			size, err := strconv.Atoi(rawSize)
-			if err != nil || size <= 0 || strconv.Itoa(size) != rawSize {
-				return policy, fmt.Errorf("%s.tp keys must be positive integers", context)
-			}
-			overrides, err := mapping(rawOverrides, fmt.Sprintf("%s.tp.%d", context, size))
+		var mm MultimodalPolicy
+		if mm.EncoderTPMode, err = multimodal.optionalString("encoder_tp_mode"); err != nil {
+			return policy, err
+		}
+		if mm.ProcessorCacheGB, err = multimodal.optionalNonNegativeFloat("processor_cache_gb"); err != nil {
+			return policy, err
+		}
+		if multimodal.present("limit_per_prompt") {
+			limits, err := mapping(multimodal.data["limit_per_prompt"], multimodal.context+".limit_per_prompt")
 			if err != nil {
 				return policy, err
 			}
-			policy.TP[size], err = parseLaunchSettings(deepMerge(defaults, overrides), fmt.Sprintf("%s.tp.%d.resolved", context, size))
-			if err != nil {
-				return policy, err
+			mm.LimitPerPrompt = map[string]int{}
+			for modality, raw := range limits {
+				count, ok := raw.(int)
+				if !ok || count < 0 {
+					return policy, fmt.Errorf("%s.limit_per_prompt.%s must be a non-negative integer", multimodal.context, modality)
+				}
+				mm.LimitPerPrompt[modality] = count
 			}
 		}
+		policy.Multimodal = &mm
 	}
 	return policy, nil
 }
 
-func parseLaunchPolicy(value any, context string) (LaunchPolicy, error) {
-	data, err := mapping(value, context)
-	if err != nil {
-		return LaunchPolicy{}, err
+func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
+	policy := KernelPolicy{
+		DType: defaultDType, Linear: defaultLinear, MoE: defaultMoE,
+		FlashinferAutotune: true, LoadFormat: defaultLoadFormat,
 	}
-	if err := checkKeys(data, context, []string{"defaults", "local", "spark_rdma"}, nil); err != nil {
-		return LaunchPolicy{}, err
+	s, ok, err := subsection(data, "kernels", context)
+	if err != nil || !ok {
+		return policy, err
 	}
-	defaults, err := mapping(data["defaults"], context+".defaults")
-	if err != nil {
-		return LaunchPolicy{}, err
+	if err := checkKeys(s.data, s.context, nil, []string{
+		"dtype", "quantization", "attention", "linear", "moe", "gdn_decode",
+		"block_size", "mamba_cache_mode", "flashinfer_autotune", "load_format",
+		"loader_extra_config",
+	}); err != nil {
+		return policy, err
 	}
-	local, err := parseTopologyPolicy(data["local"], defaults, context+".local")
-	if err != nil {
-		return LaunchPolicy{}, err
+	if policy.DType, err = s.stringOr("dtype", defaultDType); err != nil {
+		return policy, err
 	}
-	spark, err := parseTopologyPolicy(data["spark_rdma"], defaults, context+".spark_rdma")
-	if err != nil {
-		return LaunchPolicy{}, err
+	if policy.Quantization, err = s.optionalString("quantization"); err != nil {
+		return policy, err
 	}
-	return LaunchPolicy{Local: local, SparkRDMA: spark}, nil
+	if policy.Attention, err = s.optionalString("attention"); err != nil {
+		return policy, err
+	}
+	if policy.Linear, err = s.stringOr("linear", defaultLinear); err != nil {
+		return policy, err
+	}
+	if policy.MoE, err = s.stringOr("moe", defaultMoE); err != nil {
+		return policy, err
+	}
+	if policy.GDNDecode, err = s.optionalString("gdn_decode"); err != nil {
+		return policy, err
+	}
+	if policy.BlockSize, err = s.optionalPositiveInt("block_size"); err != nil {
+		return policy, err
+	}
+	if policy.MambaCacheMode, err = s.optionalString("mamba_cache_mode"); err != nil {
+		return policy, err
+	}
+	if policy.FlashinferAutotune, err = s.boolOr("flashinfer_autotune", true); err != nil {
+		return policy, err
+	}
+	if policy.LoadFormat, err = s.stringOr("load_format", defaultLoadFormat); err != nil {
+		return policy, err
+	}
+	if policy.LoaderExtraConfig, err = s.optionalMapping("loader_extra_config"); err != nil {
+		return policy, err
+	}
+	return policy, nil
 }
 
-func decodeProfile(name string, value map[string]any, context string) (ModelProfile, error) {
-	launchRaw, ok := value["launch"]
+func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, error) {
+	policy := SpeculatorPolicy{Default: "none"}
+	s, ok, err := subsection(data, "speculators", context)
+	if err != nil || !ok {
+		return policy, err
+	}
+	if err := checkKeys(s.data, s.context, nil, []string{"default", "mtp", "dflash"}); err != nil {
+		return policy, err
+	}
+	if policy.Default, err = s.stringOr("default", "none"); err != nil {
+		return policy, err
+	}
+	if !stringSet("mtp", "dflash", "none")[policy.Default] {
+		return policy, fmt.Errorf("%s.default must be mtp, dflash, or none", s.context)
+	}
+	mtp, ok, err := subsection(s.data, "mtp", s.context)
+	if err != nil {
+		return policy, err
+	}
+	if ok {
+		if err := checkKeys(mtp.data, mtp.context, nil, []string{
+			"tokens", "moe_quantization", "attention", "draft_sample_method", "model",
+		}); err != nil {
+			return policy, err
+		}
+		settings := MTPPolicy{Tokens: defaultMTPTokens}
+		if tokens, err := mtp.optionalNonNegativeInt("tokens"); err != nil {
+			return policy, err
+		} else if tokens != nil {
+			settings.Tokens = *tokens
+		}
+		if settings.MoEQuantization, err = mtp.stringOr("moe_quantization", ""); err != nil {
+			return policy, err
+		}
+		if settings.MoEQuantization != "" {
+			if _, err := MTPMoEBackendFromQuantization(settings.MoEQuantization, mtp.context); err != nil {
+				return policy, fmt.Errorf("%s.moe_quantization must be nvfp4, mxfp8, or bf16", mtp.context)
+			}
+		}
+		if settings.Attention, err = mtp.optionalString("attention"); err != nil {
+			return policy, err
+		}
+		if settings.DraftSampleMethod, err = mtp.optionalString("draft_sample_method"); err != nil {
+			return policy, err
+		}
+		model, err := mtp.optionalString("model")
+		if err != nil {
+			return policy, err
+		}
+		if model != nil {
+			if *model != "target" {
+				return policy, fmt.Errorf("%s.model must be target or null", mtp.context)
+			}
+			settings.WeightsInTarget = true
+		}
+		policy.MTP = &settings
+	}
+	dflash, ok, err := subsection(s.data, "dflash", s.context)
+	if err != nil {
+		return policy, err
+	}
+	if ok {
+		if err := checkKeys(dflash.data, dflash.context, []string{"tokens", "model"}, nil); err != nil {
+			return policy, err
+		}
+		tokens, err := dflash.optionalNonNegativeInt("tokens")
+		if err != nil {
+			return policy, err
+		}
+		if tokens == nil {
+			return policy, fmt.Errorf("%s.tokens must be a non-negative integer", dflash.context)
+		}
+		model, err := dflash.stringOr("model", "")
+		if err != nil {
+			return policy, err
+		}
+		if !hfModelID.MatchString(model) {
+			return policy, fmt.Errorf("%s.model must be a Hugging Face model ID", dflash.context)
+		}
+		policy.DFlash = &DFlashPolicy{Tokens: *tokens, Model: model}
+	}
+	if policy.Default == "mtp" && policy.MTP == nil {
+		return policy, fmt.Errorf("%s.default is mtp but no mtp section is defined", s.context)
+	}
+	if policy.Default == "dflash" && policy.DFlash == nil {
+		return policy, fmt.Errorf("%s.default is dflash but no dflash section is defined", s.context)
+	}
+	return policy, nil
+}
+
+func parseRequirements(data map[string]any, context string) (Requirements, error) {
+	s, ok, err := subsection(data, "requires", context)
+	if err != nil || !ok {
+		return Requirements{}, err
+	}
+	if err := checkKeys(s.data, s.context, nil, []string{"arch"}); err != nil {
+		return Requirements{}, err
+	}
+	arch, err := s.optionalStringList("arch")
+	if err != nil {
+		return Requirements{}, err
+	}
+	return Requirements{Arch: arch}, nil
+}
+
+func parseOverrides(data map[string]any, context string) ([]LaunchOverride, error) {
+	raw, ok := data["overrides"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
 	if !ok {
-		return ModelProfile{}, fmt.Errorf("%s is missing required key: launch", context)
+		return nil, fmt.Errorf("%s.overrides must be a list", context)
 	}
-	withoutLaunch := cloneValue(value).(map[string]any)
-	delete(withoutLaunch, "launch")
-	encoded, err := yaml.Marshal(withoutLaunch)
+	overrides := make([]LaunchOverride, 0, len(items))
+	for index, item := range items {
+		itemContext := fmt.Sprintf("%s.overrides[%d]", context, index)
+		entry, err := mapping(item, itemContext)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkKeys(entry, itemContext, []string{"when"}, []string{"capacity", "compilation", "environment"}); err != nil {
+			return nil, err
+		}
+		when, err := mapping(entry["when"], itemContext+".when")
+		if err != nil {
+			return nil, err
+		}
+		if err := checkKeys(when, itemContext+".when", nil, []string{"kind", "arch", "tp"}); err != nil {
+			return nil, err
+		}
+		if len(when) == 0 {
+			return nil, fmt.Errorf("%s.when must name at least one condition", itemContext)
+		}
+		condition := section{when, itemContext + ".when"}
+		var override LaunchOverride
+		if override.When.Kind, err = condition.stringOr("kind", ""); err != nil {
+			return nil, err
+		}
+		if override.When.Kind != "" && override.When.Kind != "local" && override.When.Kind != "spark_rdma" {
+			return nil, fmt.Errorf("%s.when.kind must be local or spark_rdma", itemContext)
+		}
+		if override.When.Arch, err = condition.stringOr("arch", ""); err != nil {
+			return nil, err
+		}
+		tp, err := condition.optionalPositiveInt("tp")
+		if err != nil {
+			return nil, err
+		}
+		if tp != nil {
+			override.When.TP = *tp
+		}
+		if override.Layer, err = parseLaunchLayer(entry, itemContext); err != nil {
+			return nil, err
+		}
+		overrides = append(overrides, override)
+	}
+	return overrides, nil
+}
+
+func decodeProfile(name string, document map[string]any, context string) (ModelProfile, error) {
+	if err := checkKeys(document, context, []string{"description", "serving"}, manifestSections); err != nil {
+		return ModelProfile{}, err
+	}
+	root := section{document, context}
+	description, err := root.stringOr("description", "")
 	if err != nil {
 		return ModelProfile{}, err
 	}
-	var raw profileYAML
-	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&raw); err != nil {
-		return ModelProfile{}, fmt.Errorf("invalid model profile %s: %w", context, err)
+	if description == "" {
+		return ModelProfile{}, fmt.Errorf("%s.description must be a non-empty string", context)
 	}
-	if !nonEmpty(raw.Description, raw.Model, raw.ServedModelName, raw.LoadFormat,
-		raw.DType, raw.LinearBackend, raw.MoEBackend, raw.ReasoningParser, raw.ToolCallParser) {
-		return ModelProfile{}, fmt.Errorf("%s contains an empty required string", context)
-	}
-	if !hfModelID.MatchString(raw.Model) {
-		return ModelProfile{}, fmt.Errorf("%s.model must be a Hugging Face model ID in owner/name form", context)
-	}
-	if len(raw.ExpectedArchitectures) == 0 || raw.AttentionHeads <= 0 {
-		return ModelProfile{}, fmt.Errorf("%s requires architectures and positive attention_heads", context)
-	}
-	if raw.WeightBytes < 0 {
-		return ModelProfile{}, fmt.Errorf("%s.weight_bytes must be positive or zero", context)
-	}
-	for _, architecture := range raw.ExpectedArchitectures {
-		if architecture == "" {
-			return ModelProfile{}, fmt.Errorf("%s.expected_architectures contains an empty value", context)
-		}
-	}
-	positivePointers := map[string]*int{
-		"block_size":                   raw.BlockSize,
-		"long_prefill_token_threshold": raw.LongPrefillTokenThreshold,
-		"cuda_device_max_connections":  raw.CUDADeviceMaxConnections,
-	}
-	for field, pointer := range positivePointers {
-		if pointer != nil && *pointer <= 0 {
-			return ModelProfile{}, fmt.Errorf("%s.%s must be positive or null", context, field)
-		}
-	}
-	if raw.MMProcessorCacheGB != nil && *raw.MMProcessorCacheGB < 0 {
-		return ModelProfile{}, fmt.Errorf("%s.mm_processor_cache_gb must be non-negative or null", context)
-	}
-	defaultSpeculator := raw.DefaultSpeculator
-	if defaultSpeculator == "" {
-		defaultSpeculator = "mtp"
-	}
-	if defaultSpeculator != "mtp" && defaultSpeculator != "dflash2" && defaultSpeculator != "none" {
-		return ModelProfile{}, fmt.Errorf("%s.default_speculator must be mtp, dflash2, or none", context)
-	}
-	mtpTokens := 3
-	if raw.MTPTokens != nil {
-		mtpTokens = *raw.MTPTokens
-	}
-	if mtpTokens < 0 || raw.DFlash2Tokens != nil && *raw.DFlash2Tokens < 0 {
-		return ModelProfile{}, fmt.Errorf("%s speculative token counts must be non-negative", context)
-	}
-	if raw.MTPModel != nil && *raw.MTPModel != "target" {
-		return ModelProfile{}, fmt.Errorf("%s.mtp_model must be target or null", context)
-	}
-	if raw.DFlash2Model != nil && !hfModelID.MatchString(*raw.DFlash2Model) {
-		return ModelProfile{}, fmt.Errorf("%s.dflash2_model must be a Hugging Face model ID", context)
-	}
-	if raw.MTPMoEQuantization != "" && raw.MTPMoEQuantization != "nvfp4" &&
-		raw.MTPMoEQuantization != "mxfp8" && raw.MTPMoEQuantization != "bf16" {
-		return ModelProfile{}, fmt.Errorf("%s.mtp_moe_quantization must be nvfp4, mxfp8, bf16, or empty", context)
-	}
-	launch, err := parseLaunchPolicy(launchRaw, context+".launch")
+	serving, err := parseServing(document, context)
 	if err != nil {
 		return ModelProfile{}, err
 	}
-	_, hfOverridesSet := value["hf_overrides"]
+	kernels, err := parseKernels(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	speculators, err := parseSpeculators(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	base, err := parseLaunchLayer(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	requires, err := parseRequirements(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	overrides, err := parseOverrides(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
 	return ModelProfile{
-		Name: name, Description: raw.Description, Model: raw.Model,
-		ServedModelName:       raw.ServedModelName,
-		ExpectedArchitectures: raw.ExpectedArchitectures,
-		AttentionHeads:        raw.AttentionHeads, WeightBytes: raw.WeightBytes,
-		Launch:       launch,
-		Quantization: raw.Quantization, LoadFormat: raw.LoadFormat,
-		DType: raw.DType, BlockSize: raw.BlockSize,
-		AttentionBackend: raw.AttentionBackend, LinearBackend: raw.LinearBackend,
-		MoEBackend: raw.MoEBackend, ReasoningParser: raw.ReasoningParser,
-		ToolCallParser: raw.ToolCallParser, TrustRemoteCode: raw.TrustRemoteCode,
-		MambaCacheMode: raw.MambaCacheMode, AsyncScheduling: raw.AsyncScheduling,
-		DisableFlashinferAutotune: raw.DisableFlashinferAutotune,
-		GDNDecodeKernel:           raw.GDNDecodeKernel,
-		ModelLoaderExtraConfig:    raw.ModelLoaderExtraConfig,
-		MMEncoderTPMode:           raw.MMEncoderTPMode,
-		MMProcessorCacheGB:        raw.MMProcessorCacheGB,
-		LimitMMPerPrompt:          raw.LimitMMPerPrompt,
-		GenerationConfig:          raw.GenerationConfig,
-		HFOverrides:               raw.HFOverrides, HFOverridesSet: hfOverridesSet,
-		LongPrefillTokenThreshold: raw.LongPrefillTokenThreshold,
-		DefaultSpeculator:         defaultSpeculator, MTPTokens: mtpTokens,
-		DFlash2Tokens: raw.DFlash2Tokens, DFlash2Model: raw.DFlash2Model,
-		MTPMoEQuantization:  raw.MTPMoEQuantization,
-		MTPAttentionBackend: raw.MTPAttentionBackend, MTPModel: raw.MTPModel,
-		MTPDraftSampleMethod:     raw.MTPDraftSampleMethod,
-		CUDADeviceMaxConnections: raw.CUDADeviceMaxConnections,
+		Name: name, Description: description, Serving: serving, Kernels: kernels,
+		Speculators: speculators, Base: base, Overrides: overrides, Requires: requires,
 	}, nil
 }
 
-type ModelProfileFile struct {
-	Label string
-	Data  []byte
-}
-
-func loadModelProfileDocument(data []byte, label string) (map[string]any, map[string]any, error) {
-	var loaded any
-	if err := yaml.Unmarshal(data, &loaded); err != nil {
-		return nil, nil, fmt.Errorf("invalid YAML in %s: %w", label, err)
-	}
-	normalized, err := normalizeYAML(loaded)
-	if err != nil {
-		return nil, nil, err
-	}
-	document, err := mapping(normalized, label)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := checkKeys(
-		document,
-		label,
-		[]string{"schema_version"},
-		[]string{"bases", "models"},
-	); err != nil {
-		return nil, nil, err
-	}
-	version, ok := document["schema_version"].(int)
-	if !ok || version != schemaVersion {
-		return nil, nil, fmt.Errorf(
-			"%s.schema_version must be %d; got %v",
-			label,
-			schemaVersion,
-			document["schema_version"],
-		)
-	}
-	bases := map[string]any{}
-	if value, ok := document["bases"]; ok {
-		bases, err = mapping(value, label+".bases")
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	models := map[string]any{}
-	if value, ok := document["models"]; ok {
-		models, err = mapping(value, label+".models")
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	if len(bases) == 0 && len(models) == 0 {
-		return nil, nil, fmt.Errorf("%s must define bases or models", label)
-	}
-	return bases, models, nil
-}
-
-func decodeModelProfiles(
-	bases map[string]any,
-	models map[string]any,
-	context string,
-) (map[string]ModelProfile, error) {
-	if len(models) == 0 {
-		return nil, fmt.Errorf("%s defines no models", context)
-	}
-	resolved, err := resolveProfileMaps(bases, models, context)
-	if err != nil {
-		return nil, err
-	}
-	profiles := make(map[string]ModelProfile, len(resolved))
-	for name, value := range resolved {
-		profile, err := decodeProfile(name, value, context+".models."+name)
-		if err != nil {
-			return nil, err
-		}
-		profiles[name] = profile
-	}
-	return profiles, nil
-}
-
-func LoadModelProfiles(data []byte, label string) (map[string]ModelProfile, error) {
-	bases, models, err := loadModelProfileDocument(data, label)
-	if err != nil {
-		return nil, err
-	}
-	return decodeModelProfiles(bases, models, label)
-}
-
-func LoadModelProfileFiles(files []ModelProfileFile) (map[string]ModelProfile, error) {
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no model profile YAML files were found")
-	}
-	ordered := append([]ModelProfileFile(nil), files...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Label < ordered[j].Label })
-	bases := map[string]any{}
-	models := map[string]any{}
-	for _, file := range ordered {
-		fileBases, fileModels, err := loadModelProfileDocument(file.Data, file.Label)
-		if err != nil {
-			return nil, err
-		}
-		for name, value := range fileBases {
-			if _, exists := bases[name]; exists {
-				return nil, fmt.Errorf("base %q is defined more than once", name)
-			}
-			bases[name] = value
-		}
-		for name, value := range fileModels {
-			if _, exists := models[name]; exists {
-				return nil, fmt.Errorf("model %q is defined more than once", name)
-			}
-			models[name] = value
-		}
-	}
-	return decodeModelProfiles(bases, models, "model profile files")
-}
-
+// LoadRepositoryModelProfile parses a repository-rooted manifest. The
+// repository ID is the model identity; the manifest may not restate it.
 func LoadRepositoryModelProfile(
-	basesData, manifestData []byte,
+	familiesData, manifestData []byte,
 	repositoryID, manifestCommit, label string,
 ) (ModelProfile, error) {
 	if !hfModelID.MatchString(repositoryID) {
@@ -649,31 +801,16 @@ func LoadRepositoryModelProfile(
 	if manifestCommit != "" && !hfCommit.MatchString(manifestCommit) {
 		return ModelProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", manifestCommit)
 	}
-	bases, baseModels, err := loadModelProfileDocument(basesData, "embedded model bases")
+	families, err := LoadFamilies(familiesData, "embedded model families")
 	if err != nil {
 		return ModelProfile{}, err
 	}
-	if len(baseModels) != 0 {
-		return ModelProfile{}, fmt.Errorf("embedded model bases must not define models")
-	}
-	var loaded any
-	if err := yaml.Unmarshal(manifestData, &loaded); err != nil {
-		return ModelProfile{}, fmt.Errorf("invalid YAML in %s: %w", label, err)
-	}
-	normalized, err := normalizeYAML(loaded)
+	document, err := parseYAMLDocument(manifestData, label)
 	if err != nil {
 		return ModelProfile{}, err
 	}
-	document, err := mapping(normalized, label)
-	if err != nil {
+	if err := schemaVersionOf(document, label); err != nil {
 		return ModelProfile{}, err
-	}
-	version, ok := document["schema_version"].(int)
-	if !ok || version != schemaVersion {
-		return ModelProfile{}, fmt.Errorf(
-			"%s.schema_version must be %d; got %v",
-			label, schemaVersion, document["schema_version"],
-		)
 	}
 	kind, ok := document["kind"].(string)
 	if !ok || kind != "model" {
@@ -682,21 +819,34 @@ func LoadRepositoryModelProfile(
 	if _, exists := document["model"]; exists {
 		return ModelProfile{}, fmt.Errorf("%s must not set model; the repository ID is authoritative", label)
 	}
-	delete(document, "schema_version")
-	delete(document, "kind")
-	document["model"] = repositoryID
+	if err := checkKeys(document, label, []string{"schema_version", "kind"}, append([]string{"family"}, manifestSections...)); err != nil {
+		return ModelProfile{}, err
+	}
+	resolved := map[string]any{}
+	familyName := ""
+	if raw, exists := document["family"]; exists && raw != nil {
+		familyName, ok = raw.(string)
+		if !ok || familyName == "" {
+			return ModelProfile{}, fmt.Errorf("%s.family must be a family name or null", label)
+		}
+		resolved, err = resolveFamily(families, familyName, nil)
+		if err != nil {
+			return ModelProfile{}, fmt.Errorf("%s: %w", label, err)
+		}
+	}
+	overlay := cloneValue(document).(map[string]any)
+	for _, key := range []string{"schema_version", "kind", "family"} {
+		delete(overlay, key)
+	}
+	resolved = deepMerge(resolved, overlay)
 	_, name, _ := strings.Cut(repositoryID, "/")
-	resolved, err := resolveProfileMaps(
-		bases, map[string]any{name: document}, label,
-	)
+	profile, err := decodeProfile(name, resolved, label)
 	if err != nil {
 		return ModelProfile{}, err
 	}
-	profile, err := decodeProfile(name, resolved[name], label)
-	if err != nil {
-		return ModelProfile{}, err
-	}
+	profile.Model = repositoryID
 	profile.ManifestCommit = manifestCommit
+	profile.Family = familyName
 	return profile, nil
 }
 
@@ -710,21 +860,12 @@ type DraftProfile struct {
 }
 
 func RepositoryManifestKind(data []byte, label string) (string, error) {
-	var loaded any
-	if err := yaml.Unmarshal(data, &loaded); err != nil {
-		return "", fmt.Errorf("invalid YAML in %s: %w", label, err)
-	}
-	normalized, err := normalizeYAML(loaded)
+	document, err := parseYAMLDocument(data, label)
 	if err != nil {
 		return "", err
 	}
-	document, err := mapping(normalized, label)
-	if err != nil {
+	if err := schemaVersionOf(document, label); err != nil {
 		return "", err
-	}
-	version, ok := document["schema_version"].(int)
-	if !ok || version != schemaVersion {
-		return "", fmt.Errorf("%s.schema_version must be %d; got %v", label, schemaVersion, document["schema_version"])
 	}
 	kind, ok := document["kind"].(string)
 	if !ok || kind != "model" && kind != "draft" {
@@ -743,9 +884,9 @@ func LoadRepositoryDraftProfile(
 	if manifestCommit != "" && !hfCommit.MatchString(manifestCommit) {
 		return DraftProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", manifestCommit)
 	}
-	var document map[string]any
-	if err := yaml.Unmarshal(manifestData, &document); err != nil {
-		return DraftProfile{}, fmt.Errorf("invalid YAML in %s: %w", label, err)
+	document, err := parseYAMLDocument(manifestData, label)
+	if err != nil {
+		return DraftProfile{}, err
 	}
 	if err := checkKeys(
 		document,
@@ -755,14 +896,16 @@ func LoadRepositoryDraftProfile(
 	); err != nil {
 		return DraftProfile{}, err
 	}
-	version, versionOK := document["schema_version"].(int)
+	if err := schemaVersionOf(document, label); err != nil {
+		return DraftProfile{}, err
+	}
 	kind, kindOK := document["kind"].(string)
 	description, descriptionOK := document["description"].(string)
 	method, methodOK := document["method"].(string)
 	quantization, quantizationOK := document["quantization"].(string)
 	compatibleRaw, compatibleOK := document["compatible_models"].([]any)
-	if !versionOK || version != schemaVersion || !kindOK || kind != "draft" {
-		return DraftProfile{}, fmt.Errorf("%s must be a schema version %d draft manifest", label, schemaVersion)
+	if !kindOK || kind != "draft" {
+		return DraftProfile{}, fmt.Errorf("%s.kind must be draft", label)
 	}
 	if !descriptionOK || description == "" || !methodOK || method != "dflash" || !quantizationOK || quantization == "" {
 		return DraftProfile{}, fmt.Errorf("%s contains invalid draft metadata", label)

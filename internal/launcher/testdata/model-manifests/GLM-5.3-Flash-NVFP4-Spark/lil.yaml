@@ -1,32 +1,25 @@
 schema_version: 1
 kind: model
-extends: glm
+family: glm
 description: GLM-5.3 Flash with NVFP4 routed experts, MXFP8 projections, and an NVFP4 MTP expert layer
-weight_bytes: 187617588984
-served_model_name: zai-org/GLM-5.3-Flash
-expected_architectures:
-  - Glm5NextForConditionalGeneration
-quantization: modelopt_mixed
-block_size: 256
-disable_flashinfer_autotune: true
-default_speculator: mtp
-mtp_tokens: 5
-dflash2_tokens: 7
-mtp_attention_backend: B12X
-mm_encoder_tp_mode: data
-mm_processor_cache_gb: 0
-launch:
-  local:
-    default_tp_size: 2
-    defaults:
-      environment:
-        INSTANTTENSOR_BUFFER_SIZE: "67108864"
-        INSTANTTENSOR_CHUNK_SIZE: "8388608"
-  spark_rdma:
-    default_tp_size: all
-    defaults:
-      environment:
-        INSTANTTENSOR_BUFFER_SIZE: "67108864"
-        INSTANTTENSOR_CHUNK_SIZE: "8388608"
-mtp_moe_quantization: nvfp4
-dflash2_model: local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8
+serving:
+  served_model_name: zai-org/GLM-5.3-Flash
+  multimodal:
+    encoder_tp_mode: data
+    processor_cache_gb: 0
+kernels:
+  quantization: modelopt_mixed
+  block_size: 256
+  flashinfer_autotune: false
+speculators:
+  default: mtp
+  mtp:
+    tokens: 5
+    moe_quantization: nvfp4
+    attention: B12X
+  dflash:
+    tokens: 7
+    model: local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8
+environment:
+  INSTANTTENSOR_BUFFER_SIZE: "67108864"
+  INSTANTTENSOR_CHUNK_SIZE: "8388608"
