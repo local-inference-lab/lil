@@ -33,13 +33,19 @@ var managedVLLMFlags = stringSet(
 	"--reasoning-parser", "--revision", "--served-model-name", "--speculative-config",
 	"--tensor-parallel-size", "--tool-call-parser", "--trust-remote-code",
 	"--device-ids", "--distributed-executor-backend", "--headless",
+	"--tokenizer-mode", "--scheduler-reserve-full-isl", "--enable-prompt-tokens-details",
+	"--enable-force-include-usage", "--enable-request-id-headers",
+	"--default-chat-template-kwargs", "--prefix-cache-retention-interval",
+	"--max-cudagraph-capture-size", "--cudagraph-capture-sizes",
+	"--enable-flashinfer-autotune",
 )
 
 var managedVLLMNegatedFlags = stringSet(
-	"--enable-flashinfer-autotune", "--no-async-scheduling",
-	"--no-disable-custom-all-reduce", "--no-enable-auto-tool-choice",
-	"--no-enable-chunked-prefill", "--no-enable-prefix-caching",
-	"--no-trust-remote-code", "--no-headless",
+	"--no-async-scheduling", "--no-disable-custom-all-reduce",
+	"--no-enable-auto-tool-choice", "--no-enable-chunked-prefill",
+	"--no-enable-prefix-caching", "--no-trust-remote-code", "--no-headless",
+	"--no-scheduler-reserve-full-isl", "--no-enable-prompt-tokens-details",
+	"--no-enable-force-include-usage", "--no-enable-request-id-headers",
 )
 
 var vllmFlagAliases = map[string]string{
@@ -222,7 +228,7 @@ func defaultCapacityLayer() map[string]any {
 
 // resolveLaunchSettings folds launcher defaults, the manifest base layer, and
 // every override whose condition matches this launch, in manifest order.
-func resolveLaunchSettings(profile ModelProfile, topology Topology, tpSize int) (LaunchSettings, []int, error) {
+func resolveLaunchSettings(profile ModelProfile, topology Topology, tpSize int, speculator string) (LaunchSettings, []int, error) {
 	capacity := defaultCapacityLayer()
 	var compilation map[string]any
 	environment := map[string]string{}
@@ -243,7 +249,7 @@ func resolveLaunchSettings(profile ModelProfile, topology Topology, tpSize int) 
 	apply(profile.Base)
 	applied := []int{}
 	for index, override := range profile.Overrides {
-		if override.When.Matches(topology.Kind, topology.CuteDSLArch(), tpSize) {
+		if override.When.Matches(topology.Kind, topology.CuteDSLArch(), tpSize, speculator) {
 			apply(override.Layer)
 			applied = append(applied, index)
 		}
@@ -309,8 +315,8 @@ func validateOptions(options LaunchOptions) error {
 	if !stringSet("auto", "heuristic-only", "preplanned-only")[options.B12XPolicyMode] {
 		return fmt.Errorf("B12X policy mode must be auto, heuristic-only, or preplanned-only")
 	}
-	if options.Speculator != nil && !stringSet("mtp", "dflash", "none")[*options.Speculator] {
-		return fmt.Errorf("speculator must be mtp, dflash, or none")
+	if options.Speculator != nil && !speculatorMethods[*options.Speculator] {
+		return fmt.Errorf("speculator must be mtp, dflash, dspark, or none")
 	}
 	return nil
 }
@@ -322,8 +328,33 @@ type speculation struct {
 	Decision *MTPMoEBackendDecision
 }
 
+// Effective is the method that actually runs: a zero-depth launch is "none"
+// for overrides and graph sizing.
+func (s speculation) Effective() string {
+	if s.Tokens == 0 {
+		return "none"
+	}
+	return s.Method
+}
+
 func mtpBackendDecision(policy MTPPolicy, facts *CheckpointFacts, dtype string) (MTPMoEBackendDecision, error) {
 	decision, err := MTPMoEBackendFromConfig(facts.Config, dtype)
+	if policy.MoEQuantization != "" && decision.Quantization != "" && decision.Quantization != policy.MoEQuantization {
+		return MTPMoEBackendDecision{}, fmt.Errorf(
+			"MTP MoE quantization mismatch: manifest declares %s, %s contains %s",
+			policy.MoEQuantization, facts.Source, decision.Quantization,
+		)
+	}
+	if policy.MoEBackend != nil {
+		quantization := decision.Quantization
+		if quantization == "" {
+			quantization = policy.MoEQuantization
+		}
+		return MTPMoEBackendDecision{
+			Quantization: quantization, Backend: *policy.MoEBackend,
+			Evidence: []string{"lil.yaml moe_backend"},
+		}, nil
+	}
 	if err != nil {
 		if policy.MoEQuantization == "" {
 			return MTPMoEBackendDecision{}, fmt.Errorf(
@@ -333,12 +364,6 @@ func mtpBackendDecision(policy MTPPolicy, facts *CheckpointFacts, dtype string) 
 		}
 		return MTPMoEBackendFromQuantization(
 			policy.MoEQuantization, fmt.Sprintf("lil.yaml (checkpoint metadata inconclusive: %v)", err),
-		)
-	}
-	if policy.MoEQuantization != "" && decision.Quantization != policy.MoEQuantization {
-		return MTPMoEBackendDecision{}, fmt.Errorf(
-			"MTP MoE quantization mismatch: manifest declares %s, %s contains %s",
-			policy.MoEQuantization, facts.Source, decision.Quantization,
 		)
 	}
 	return decision, nil
@@ -354,16 +379,22 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 		if options.AdaptiveSpeculativeTokens {
 			return result, fmt.Errorf("adaptive speculation requires an MTP launch")
 		}
+		if options.AdaptiveVerification {
+			return result, fmt.Errorf("adaptive verification requires a DSpark launch")
+		}
 		return result, nil
+	}
+	if options.AdaptiveVerification && method != "dspark" {
+		return result, fmt.Errorf("adaptive verification is supported only for DSpark")
+	}
+	if options.AdaptiveSpeculativeTokens && method != "mtp" {
+		return result, fmt.Errorf("adaptive speculation is supported only for MTP")
 	}
 	switch method {
 	case "dflash":
 		policy := profile.Speculators.DFlash
 		if policy == nil {
 			return result, fmt.Errorf("model %q does not define a DFlash speculator", profile.Name)
-		}
-		if options.AdaptiveSpeculativeTokens {
-			return result, fmt.Errorf("adaptive speculation is supported only for MTP")
 		}
 		tokens := policy.Tokens
 		if options.SpeculativeTokens != nil {
@@ -376,6 +407,40 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 		config := map[string]any{
 			"method": "dflash", "model": policy.Model,
 			"num_speculative_tokens": tokens, "kv_cache_dtype": "auto",
+		}
+		encoded, err := compactJSON(config)
+		result.Config = &encoded
+		return result, err
+	case "dspark":
+		policy := profile.Speculators.DSpark
+		if policy == nil {
+			return result, fmt.Errorf("model %q does not define a DSpark speculator", profile.Name)
+		}
+		tokens := policy.Tokens
+		if options.SpeculativeTokens != nil {
+			tokens = *options.SpeculativeTokens
+		}
+		result.Tokens = tokens
+		if tokens == 0 {
+			return result, nil
+		}
+		config := map[string]any{
+			"method": "dspark", "model": modelSource, "num_speculative_tokens": tokens,
+		}
+		if profile.Revision != "" && modelSource == profile.Model {
+			config["revision"] = profile.Revision
+		}
+		if policy.DraftSampleMethod != nil {
+			config["draft_sample_method"] = *policy.DraftSampleMethod
+		}
+		if policy.RejectionSampleMethod != nil {
+			config["rejection_sample_method"] = *policy.RejectionSampleMethod
+		}
+		if policy.Attention != nil {
+			config["attention_backend"] = *policy.Attention
+		}
+		if policy.AdaptiveVerification || options.AdaptiveVerification {
+			config["enable_adaptive_verification"] = true
 		}
 		encoded, err := compactJSON(config)
 		result.Config = &encoded
@@ -406,12 +471,18 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 		}
 		if policy.WeightsInTarget {
 			config["model"] = modelSource
+			if profile.Revision != "" && modelSource == profile.Model {
+				config["revision"] = profile.Revision
+			}
 		}
 		if policy.Attention != nil {
 			config["attention_backend"] = *policy.Attention
 		}
 		if policy.DraftSampleMethod != nil {
 			config["draft_sample_method"] = *policy.DraftSampleMethod
+		}
+		if policy.RejectionSampleMethod != nil {
+			config["rejection_sample_method"] = *policy.RejectionSampleMethod
 		}
 		if options.AdaptiveSpeculativeTokens {
 			initial := min(3, tokens)
@@ -432,8 +503,12 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 	}
 }
 
-func cudagraphCaptureSizes(maxNumSeqs, maxNumBatchedTokens, queryLen int) []int {
-	maxMixedTokens := min(maxNumSeqs*queryLen*2, maxNumBatchedTokens, 1024)
+// cudagraphCaptureSizes covers every uniform verification batch through
+// maxNumSeqs plus a mixed-batch ladder. The ladder extends to twice the
+// uniform maximum except for DSpark, whose verifier never exceeds one
+// sampled token plus its drafts per request.
+func cudagraphCaptureSizes(maxNumSeqs, maxNumBatchedTokens, queryLen, mixedMultiplier int) []int {
+	maxMixedTokens := min(maxNumSeqs*queryLen*mixedMultiplier, maxNumBatchedTokens, 1024)
 	sizes := make(map[int]bool, maxNumSeqs+maxMixedTokens/8)
 	add := func(size int) {
 		if size > 0 && size <= maxNumBatchedTokens {
@@ -470,12 +545,15 @@ func compilationConfig(settings LaunchSettings, maxNumSeqs, maxNumBatchedTokens 
 		return nil
 	}
 	config := cloneValue(settings.CompilationConfig).(map[string]any)
-	queryLen := 1
-	if spec.Method == "mtp" && spec.Tokens > 0 {
+	queryLen, mixedMultiplier := 1, 2
+	switch spec.Effective() {
+	case "mtp":
 		queryLen = spec.Tokens + 1
+	case "dspark":
+		queryLen, mixedMultiplier = spec.Tokens+1, 1
 	}
 	config["cudagraph_capture_sizes"] = cudagraphCaptureSizes(
-		maxNumSeqs, maxNumBatchedTokens, queryLen,
+		maxNumSeqs, maxNumBatchedTokens, queryLen, mixedMultiplier,
 	)
 	return config
 }
@@ -559,11 +637,17 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 	} else {
 		argv = []string{topology.Local.Python, "-m", "vllm.entrypoints.cli.main", "serve", in.modelSource}
 	}
+	if profile.Revision != "" && in.modelSource == profile.Model {
+		appendOption(&argv, "--revision", &profile.Revision)
+	}
 	appendOption(&argv, "--served-model-name", &in.servedModelName)
 	appendOption(&argv, "--host", &in.host)
 	appendOption(&argv, "--port", stringPointer(strconv.Itoa(in.port)))
 	if serving.TrustRemoteCode {
 		argv = append(argv, "--trust-remote-code")
+	}
+	if serving.TokenizerMode != "" {
+		appendOption(&argv, "--tokenizer-mode", &serving.TokenizerMode)
 	}
 	if in.deviceIDs != nil {
 		parts := make([]string, len(in.deviceIDs))
@@ -582,12 +666,16 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 	appendOption(&argv, "--mamba-cache-mode", kernels.MambaCacheMode)
 	if serving.PrefixCaching {
 		argv = append(argv, "--enable-prefix-caching")
+		appendOption(&argv, "--prefix-cache-retention-interval", intPointerString(serving.PrefixCacheRetentionInterval))
 	}
 	if serving.ChunkedPrefill {
 		argv = append(argv, "--enable-chunked-prefill")
 	}
 	if serving.AsyncScheduling {
 		argv = append(argv, "--async-scheduling")
+	}
+	if !serving.SchedulerReserveFullISL {
+		argv = append(argv, "--no-scheduler-reserve-full-isl")
 	}
 	appendOption(&argv, "--dtype", &kernels.DType)
 	appendOption(&argv, "--kv-cache-dtype", &options.KVCacheDType)
@@ -597,8 +685,12 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 	appendOption(&argv, "--linear-backend", &kernels.Linear)
 	appendOption(&argv, "--moe-backend", &kernels.MoE)
 	appendOption(&argv, "--gdn-decode-kernel", kernels.GDNDecode)
-	if !kernels.FlashinferAutotune {
-		argv = append(argv, "--no-enable-flashinfer-autotune")
+	if kernels.FlashinferAutotune != nil {
+		if *kernels.FlashinferAutotune {
+			argv = append(argv, "--enable-flashinfer-autotune")
+		} else {
+			argv = append(argv, "--no-enable-flashinfer-autotune")
+		}
 	}
 	appendOption(&argv, "--load-format", &kernels.LoadFormat)
 	if kernels.LoaderExtraConfig != nil {
@@ -636,6 +728,18 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 		argv = append(argv, "--enable-auto-tool-choice")
 	}
 	appendOption(&argv, "--generation-config", serving.GenerationConfig)
+	if serving.PromptTokensDetails {
+		argv = append(argv, "--enable-prompt-tokens-details")
+	}
+	if serving.ForceIncludeUsage {
+		argv = append(argv, "--enable-force-include-usage")
+	}
+	if serving.RequestIDHeaders {
+		argv = append(argv, "--enable-request-id-headers")
+	}
+	for _, key := range sortedMapKeys(serving.ChatTemplateKwargs) {
+		argv = append(argv, fmt.Sprintf("--default-chat-template-kwargs.%s=%v", key, serving.ChatTemplateKwargs[key]))
+	}
 	if len(serving.HFOverrides) > 0 {
 		value, err := compactJSON(serving.HFOverrides)
 		if err != nil {
@@ -800,6 +904,9 @@ func sparkNodeLaunches(topology *SparkRDMATopology, profile ModelProfile, runtim
 	if profile.ManifestCommit != "" {
 		labels["lil.manifest_commit"] = profile.ManifestCommit
 	}
+	if profile.Revision != "" {
+		labels["lil.revision"] = profile.Revision
+	}
 	selected := topology.Nodes[:tpSize]
 	launches := make([]SparkNodeLaunch, 0, len(selected))
 	for rank, node := range selected {
@@ -898,16 +1005,16 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 	if options.Port != nil {
 		port = *options.Port
 	}
-	settings, appliedOverrides, err := resolveLaunchSettings(profile, topology, tpSize)
+	spec, err := speculativeConfig(profile, facts, modelSource, options)
+	if err != nil {
+		return LaunchSpec{}, err
+	}
+	settings, appliedOverrides, err := resolveLaunchSettings(profile, topology, tpSize, spec.Effective())
 	if err != nil {
 		return LaunchSpec{}, err
 	}
 	capacity := resolveCapacity(settings, topology, options)
 	environment, unsetEnvironment, err := runtimeEnvironment(topology, settings, options)
-	if err != nil {
-		return LaunchSpec{}, err
-	}
-	spec, err := speculativeConfig(profile, facts, modelSource, options)
 	if err != nil {
 		return LaunchSpec{}, err
 	}
@@ -924,9 +1031,10 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 		return LaunchSpec{}, err
 	}
 	metadata := map[string]any{
-		"capacity": capacity, "speculator": spec.Method, "speculative_tokens": spec.Tokens,
+		"capacity": capacity, "speculator": spec.Effective(), "speculative_tokens": spec.Tokens,
 		"kv_cache_dtype": options.KVCacheDType, "memory": memory,
 		"manifest_commit": profile.ManifestCommit, "family": profile.Family,
+		"repository": profile.Model, "revision": profile.Revision,
 		"checkpoint_facts": factsMetadata(facts), "applied_overrides": appliedOverrides,
 		"tensor_parallel": map[string]any{
 			"size": tpSize, "default": defaultTP, "policy": topology.DefaultTP,
@@ -939,19 +1047,19 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 			"evidence": spec.Decision.Evidence,
 		}
 	}
-	downloadRepositories := []string{}
+	downloads := []RepositoryDownload{}
 	if checkpointPath == nil {
-		downloadRepositories = append(downloadRepositories, profile.Model)
+		downloads = append(downloads, RepositoryDownload{Repository: profile.Model, Revision: profile.Revision})
 	}
-	if spec.Method == "dflash" && spec.Tokens > 0 && profile.Speculators.DFlash != nil &&
-		!contains(downloadRepositories, profile.Speculators.DFlash.Model) {
-		downloadRepositories = append(downloadRepositories, profile.Speculators.DFlash.Model)
+	if spec.Effective() == "dflash" && profile.Speculators.DFlash != nil &&
+		profile.Speculators.DFlash.Model != profile.Model {
+		downloads = append(downloads, RepositoryDownload{Repository: profile.Speculators.DFlash.Model})
 	}
 	launch := LaunchSpec{
 		Model: profile, Topology: topology, TPSize: tpSize, ModelSource: modelSource,
 		CheckpointPath: checkpointPath, ServedModelName: servedModelName, Host: host, Port: port,
 		Detach: options.Detach, SyncCode: options.SyncCode, SyncModel: options.SyncModel,
-		DownloadRepositories: downloadRepositories, RuntimeEnvironment: environment,
+		Downloads: downloads, RuntimeEnvironment: environment,
 		UnsetEnvironment: unsetEnvironment, VLLMArgv: vllmArgv, DeviceIDs: deviceIDs,
 		Metadata: metadata,
 	}

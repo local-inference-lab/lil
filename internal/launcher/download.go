@@ -65,18 +65,33 @@ func warnUnmanagedDownload(repository, location string) {
 	)
 }
 
+func downloadArguments(download RepositoryDownload) []string {
+	arguments := []string{"download", download.Repository}
+	if download.Revision != "" {
+		arguments = append(arguments, "--revision", download.Revision)
+	}
+	return arguments
+}
+
+func (d RepositoryDownload) String() string {
+	if d.Revision == "" {
+		return d.Repository
+	}
+	return d.Repository + "@" + d.Revision[:12]
+}
+
 func syncLocalHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
 	hf := localHFCLI(spec)
 	if hf == "" {
-		for _, repository := range spec.DownloadRepositories {
-			warnUnmanagedDownload(repository, "next to the configured vLLM Python and on PATH")
+		for _, download := range spec.Downloads {
+			warnUnmanagedDownload(download.String(), "next to the configured vLLM Python and on PATH")
 		}
 		return nil
 	}
-	for _, repository := range spec.DownloadRepositories {
-		fmt.Fprintf(os.Stderr, "updating Hugging Face cache for %s\n", repository)
-		if err := runVisible(ctx, []string{hf, "download", repository}, onlineEnvironment(spec)); err != nil {
-			return fmt.Errorf("Hugging Face download failed for %s: %w", repository, err)
+	for _, download := range spec.Downloads {
+		fmt.Fprintf(os.Stderr, "updating Hugging Face cache for %s\n", download)
+		if err := runVisible(ctx, append([]string{hf}, downloadArguments(download)...), onlineEnvironment(spec)); err != nil {
+			return fmt.Errorf("Hugging Face download failed for %s: %w", download, err)
 		}
 	}
 	return nil
@@ -152,29 +167,29 @@ func syncSparkHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
 		if hostHF == "" {
 			useContainerHF = sparkContainerHFIsAvailable(ctx, node.Node.SSHHost, topology)
 		}
-		for _, repository := range spec.DownloadRepositories {
+		for _, download := range spec.Downloads {
 			if hostHF == "" && !useContainerHF {
-				warnUnmanagedDownload(repository, "on "+node.Node.SSHHost+" or in "+topology.Image)
+				warnUnmanagedDownload(download.String(), "on "+node.Node.SSHHost+" or in "+topology.Image)
 				continue
 			}
 			fmt.Fprintf(
 				os.Stderr, "updating Hugging Face cache for %s on %s\n",
-				repository, node.Node.SSHHost,
+				download, node.Node.SSHHost,
 			)
-			argv := sparkHostHFArgv(topology, hostHF, "download", repository)
+			argv := sparkHostHFArgv(topology, hostHF, downloadArguments(download)...)
 			if useContainerHF {
-				argv = sparkContainerHFArgv(topology, "download", repository)
+				argv = sparkContainerHFArgv(topology, downloadArguments(download)...)
 			}
 			remote := RemoteArgv(node.Node.SSHHost, argv)
 			if err := runVisible(ctx, remote, nil); err != nil {
 				var exit *exec.ExitError
 				if errors.As(err, &exit) && exit.ExitCode() == 127 {
-					warnUnmanagedDownload(repository, "on "+node.Node.SSHHost)
+					warnUnmanagedDownload(download.String(), "on "+node.Node.SSHHost)
 					continue
 				}
 				return fmt.Errorf(
 					"Hugging Face download failed for %s on %s: %w",
-					repository, node.Node.SSHHost, err,
+					download, node.Node.SSHHost, err,
 				)
 			}
 		}
@@ -185,7 +200,7 @@ func syncSparkHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
 // SyncHuggingFaceCache updates every unpinned Hub repository needed by a launch.
 // An unavailable hf CLI is non-fatal because vLLM can still populate its cache.
 func SyncHuggingFaceCache(ctx context.Context, spec LaunchSpec) error {
-	if len(spec.DownloadRepositories) == 0 {
+	if len(spec.Downloads) == 0 {
 		return nil
 	}
 	if spec.Topology.Spark != nil {

@@ -1,0 +1,32 @@
+schema_version: 1
+kind: model
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+family: deepseek-v4
+description: DeepSeek V4 Flash 0731 with block-FP8 projections, MXFP4 routed experts, and a DSpark draft head
+serving:
+  served_model_name: DeepSeek-V4-Flash-0731
+speculators:
+  default: dspark
+  dspark:
+    tokens: 7
+    model: target
+    draft_sample_method: probabilistic
+    rejection_sample_method: standard
+  mtp:
+    tokens: 3
+    moe_quantization: mxfp4
+    draft_sample_method: probabilistic
+    rejection_sample_method: standard
+capacity:
+  max_num_seqs: 16
+  max_num_batched_tokens: 8192
+overrides:
+  - when:
+      speculator: none
+    capacity:
+      max_num_seqs: 64
+  - when:
+      speculator: mtp
+    capacity:
+      max_num_seqs: 64

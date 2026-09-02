@@ -207,15 +207,17 @@ type LaunchLayer struct {
 // OverrideCondition selects the launches an override applies to. Zero-valued
 // fields are unconstrained; set fields must all match.
 type OverrideCondition struct {
-	Kind string
-	Arch string
-	TP   int
+	Kind       string
+	Arch       string
+	TP         int
+	Speculator string
 }
 
-func (c OverrideCondition) Matches(kind, arch string, tpSize int) bool {
+func (c OverrideCondition) Matches(kind, arch string, tpSize int, speculator string) bool {
 	return (c.Kind == "" || c.Kind == kind) &&
 		(c.Arch == "" || c.Arch == arch) &&
-		(c.TP == 0 || c.TP == tpSize)
+		(c.TP == 0 || c.TP == tpSize) &&
+		(c.Speculator == "" || c.Speculator == speculator)
 }
 
 type LaunchOverride struct {
@@ -236,18 +238,25 @@ type MultimodalPolicy struct {
 }
 
 type ServingPolicy struct {
-	ServedModelName           string
-	TrustRemoteCode           bool
-	ReasoningParser           string
-	ToolCallParser            string
-	AutoToolChoice            bool
-	GenerationConfig          *string
-	HFOverrides               map[string]any
-	AsyncScheduling           bool
-	PrefixCaching             bool
-	ChunkedPrefill            bool
-	LongPrefillTokenThreshold *int
-	Multimodal                *MultimodalPolicy
+	ServedModelName              string
+	TrustRemoteCode              bool
+	TokenizerMode                string
+	ReasoningParser              string
+	ToolCallParser               string
+	AutoToolChoice               bool
+	GenerationConfig             *string
+	HFOverrides                  map[string]any
+	ChatTemplateKwargs           map[string]any
+	AsyncScheduling              bool
+	SchedulerReserveFullISL      bool
+	PrefixCaching                bool
+	PrefixCacheRetentionInterval *int
+	ChunkedPrefill               bool
+	LongPrefillTokenThreshold    *int
+	PromptTokensDetails          bool
+	ForceIncludeUsage            bool
+	RequestIDHeaders             bool
+	Multimodal                   *MultimodalPolicy
 }
 
 type KernelPolicy struct {
@@ -259,17 +268,19 @@ type KernelPolicy struct {
 	GDNDecode          *string
 	BlockSize          *int
 	MambaCacheMode     *string
-	FlashinferAutotune bool
+	FlashinferAutotune *bool
 	LoadFormat         string
 	LoaderExtraConfig  map[string]any
 }
 
 type MTPPolicy struct {
-	Tokens            int
-	MoEQuantization   string
-	Attention         *string
-	DraftSampleMethod *string
-	WeightsInTarget   bool
+	Tokens                int
+	MoEQuantization       string
+	MoEBackend            *string
+	Attention             *string
+	DraftSampleMethod     *string
+	RejectionSampleMethod *string
+	WeightsInTarget       bool
 }
 
 type DFlashPolicy struct {
@@ -277,10 +288,21 @@ type DFlashPolicy struct {
 	Model  string
 }
 
+// DSparkPolicy describes a DeepSeek DSpark draft, which ships inside the
+// target checkpoint.
+type DSparkPolicy struct {
+	Tokens                int
+	Attention             *string
+	DraftSampleMethod     *string
+	RejectionSampleMethod *string
+	AdaptiveVerification  bool
+}
+
 type SpeculatorPolicy struct {
 	Default string
 	MTP     *MTPPolicy
 	DFlash  *DFlashPolicy
+	DSpark  *DSparkPolicy
 }
 
 type Requirements struct {
@@ -302,6 +324,7 @@ type ModelProfile struct {
 	Name           string
 	Description    string
 	Model          string
+	Revision       string
 	ManifestCommit string
 	Family         string
 	Serving        ServingPolicy
@@ -348,6 +371,7 @@ type LaunchOptions struct {
 	AdaptiveSpeculativeTokens bool
 	AdaptiveWindow            int
 	AdaptiveInitial           *int
+	AdaptiveVerification      bool
 	PLECPUOffload             *bool
 	B12XPolicyMode            string
 	Profiler                  *ProfilerOptions
@@ -367,27 +391,34 @@ type SparkNodeLaunch struct {
 	DockerArgv         []string          `json:"docker_argv"`
 }
 
+// RepositoryDownload names a Hub repository a launch needs in the standard
+// cache, pinned to a commit when the manifest pins one.
+type RepositoryDownload struct {
+	Repository string `json:"repository"`
+	Revision   string `json:"revision,omitempty"`
+}
+
 type LaunchSpec struct {
-	Model                ModelProfile
-	Topology             Topology
-	TPSize               int
-	ModelSource          string
-	CheckpointPath       *string
-	ServedModelName      string
-	Host                 string
-	Port                 int
-	Detach               bool
-	SyncCode             bool
-	SyncModel            bool
-	DownloadRepositories []string
-	RuntimeEnvironment   map[string]string
-	HostEnvironment      map[string]string
-	UnsetEnvironment     []string
-	VLLMArgv             []string
-	CommandArgv          []string
-	DeviceIDs            []int
-	SparkNodes           []SparkNodeLaunch
-	Metadata             map[string]any
+	Model              ModelProfile
+	Topology           Topology
+	TPSize             int
+	ModelSource        string
+	CheckpointPath     *string
+	ServedModelName    string
+	Host               string
+	Port               int
+	Detach             bool
+	SyncCode           bool
+	SyncModel          bool
+	Downloads          []RepositoryDownload
+	RuntimeEnvironment map[string]string
+	HostEnvironment    map[string]string
+	UnsetEnvironment   []string
+	VLLMArgv           []string
+	CommandArgv        []string
+	DeviceIDs          []int
+	SparkNodes         []SparkNodeLaunch
+	Metadata           map[string]any
 }
 
 type SparkTarget struct {

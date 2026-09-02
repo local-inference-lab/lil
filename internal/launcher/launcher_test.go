@@ -16,12 +16,15 @@ import (
 )
 
 const (
-	qwenProfile          = "Qwen3.8-Flash-Next-NVFP4"
-	glmFlashProfile      = "GLM-5.3-Flash-NVFP4"
-	glmFlashSparkProfile = "GLM-5.3-Flash-NVFP4-Spark"
-	glmProfile           = "GLM-5.3-NVFP4"
-	glmSparkProfile      = "GLM-5.3-NVFP4-Spark"
-	testCommit           = "0123456789abcdef0123456789abcdef01234567"
+	qwenProfile           = "Qwen3.8-Flash-Next-NVFP4"
+	glmFlashProfile       = "GLM-5.3-Flash-NVFP4"
+	glmFlashSparkProfile  = "GLM-5.3-Flash-NVFP4-Spark"
+	glmProfile            = "GLM-5.3-NVFP4"
+	glmSparkProfile       = "GLM-5.3-NVFP4-Spark"
+	deepseekProfile       = "DeepSeek-V4-Flash-0731"
+	deepseekVisionProfile = "DeepSeek-V4-Flash-Vision-Exp"
+	deepseekRevision      = "9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
+	testCommit            = "0123456789abcdef0123456789abcdef01234567"
 )
 
 type testConfig struct {
@@ -60,9 +63,18 @@ func loadTestConfig(t *testing.T) testConfig {
 		if err != nil {
 			t.Fatal(err)
 		}
-		profile, err := LoadRepositoryModelProfile(
-			families, data, "local-inference-lab/"+entry.Name(), testCommit, directory+"/lil.yaml",
-		)
+		external, err := ManifestNamesModel(data, directory+"/lil.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var profile ModelProfile
+		if external {
+			profile, err = LoadCatalogModelProfile(families, data, entry.Name(), testCommit, directory+"/lil.yaml")
+		} else {
+			profile, err = LoadRepositoryModelProfile(
+				families, data, "local-inference-lab/"+entry.Name(), testCommit, directory+"/lil.yaml",
+			)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -175,6 +187,7 @@ func loadManifest(t *testing.T, families []byte, name, manifest string) (ModelPr
 func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 	config := loadTestConfig(t)
 	want := []string{
+		deepseekProfile, deepseekVisionProfile,
 		glmFlashProfile, glmFlashSparkProfile, glmProfile, glmSparkProfile,
 		qwenProfile,
 	}
@@ -182,9 +195,12 @@ func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 		t.Fatalf("profile names: got %v, want %v", got, want)
 	}
 	for name, profile := range config.profiles {
-		_, repository, ok := strings.Cut(profile.Model, "/")
+		owner, repository, ok := strings.Cut(profile.Model, "/")
 		if !ok || repository != name || profile.ManifestCommit != testCommit {
 			t.Errorf("profile %q has Hugging Face model %q commit %q", name, profile.Model, profile.ManifestCommit)
+		}
+		if (owner != "local-inference-lab") != (profile.Revision != "") {
+			t.Errorf("profile %q owner %q revision %q: only catalog entries pin revisions", name, owner, profile.Revision)
 		}
 	}
 }
@@ -313,11 +329,13 @@ func TestManifestSchemaFailsClosed(t *testing.T) {
 func TestDefaultTPFollowsFitOrWholeCluster(t *testing.T) {
 	config := loadTestConfig(t)
 	for name, want := range map[string]struct{ local, spark int }{
-		glmProfile:           {8, 2},
-		glmSparkProfile:      {8, 2},
-		glmFlashProfile:      {4, 2},
-		glmFlashSparkProfile: {4, 2},
-		qwenProfile:          {2, 2},
+		glmProfile:            {8, 2},
+		glmSparkProfile:       {8, 2},
+		glmFlashProfile:       {4, 2},
+		glmFlashSparkProfile:  {4, 2},
+		qwenProfile:           {2, 2},
+		deepseekProfile:       {2, 2},
+		deepseekVisionProfile: {2, 2},
 	} {
 		profile := config.profiles[name]
 		for _, item := range []struct {
@@ -690,13 +708,17 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 func TestMTPBackendDerivesFromRealConfigsAndMatchesManifestAssertions(t *testing.T) {
 	config := loadTestConfig(t)
 	for name, want := range map[string][2]string{
-		glmProfile:           {"bf16", "triton"},
-		glmSparkProfile:      {"nvfp4", "b12x"},
-		glmFlashProfile:      {"mxfp8", "triton"},
-		glmFlashSparkProfile: {"nvfp4", "b12x"},
-		qwenProfile:          {"nvfp4", "b12x"},
+		glmProfile:            {"bf16", "triton"},
+		glmSparkProfile:       {"nvfp4", "b12x"},
+		glmFlashProfile:       {"mxfp8", "triton"},
+		glmFlashSparkProfile:  {"nvfp4", "b12x"},
+		qwenProfile:           {"nvfp4", "b12x"},
+		deepseekProfile:       {"mxfp4", "b12x"},
+		deepseekVisionProfile: {"mxfp4", "b12x"},
 	} {
-		spec, err := BuildLaunchSpec(config.profiles[name], config.local, defaultOptions(0))
+		options := defaultOptions(0)
+		options.Speculator = stringPointerTest("mtp")
+		spec, err := BuildLaunchSpec(config.profiles[name], config.local, options)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -729,8 +751,8 @@ func TestExplicitCheckpointMustAgreeWithRepositoryFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(spec.DownloadRepositories) != 0 || spec.CheckpointPath == nil {
-		t.Fatalf("local checkpoint launch requested Hub downloads: %+v", spec.DownloadRepositories)
+	if len(spec.Downloads) != 0 || spec.CheckpointPath == nil {
+		t.Fatalf("local checkpoint launch requested Hub downloads: %+v", spec.Downloads)
 	}
 	memory := spec.Metadata["memory"].(map[string]any)
 	if got := memory["estimated_sharded_weight_bytes_per_rank"]; got != int64(24000000000) {
@@ -816,7 +838,7 @@ func TestCUDAGraphCaptureSizesFollowSequenceCountsWithoutMTP(t *testing.T) {
 
 func TestCUDAGraphCaptureSizesKeepEveryMTPBatchShape(t *testing.T) {
 	wantMTPShapes := []int{4, 8, 12, 16, 20, 24, 28, 32}
-	got := cudagraphCaptureSizes(8, 4096, 4)
+	got := cudagraphCaptureSizes(8, 4096, 4, 2)
 	for _, shape := range wantMTPShapes {
 		if !slices.Contains(got, shape) {
 			t.Errorf("capture sizes %v omit MTP verification shape %d", got, shape)
@@ -980,12 +1002,12 @@ func TestHubLaunchDownloadsTargetAndDraftRepositories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{
-		"local-inference-lab/GLM-5.3-Flash-NVFP4",
-		"local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8",
+	want := []RepositoryDownload{
+		{Repository: "local-inference-lab/GLM-5.3-Flash-NVFP4"},
+		{Repository: "local-inference-lab/GLM-5.3-Flash-DFlash2-MXFP8"},
 	}
-	if !reflect.DeepEqual(spec.DownloadRepositories, want) {
-		t.Fatalf("download repositories: got %v, want %v", spec.DownloadRepositories, want)
+	if !reflect.DeepEqual(spec.Downloads, want) {
+		t.Fatalf("downloads: got %v, want %v", spec.Downloads, want)
 	}
 	if slices.Contains(spec.VLLMArgv, "--revision") || spec.CheckpointPath != nil {
 		t.Fatalf("Hub launch is unexpectedly revision-bound: %+v", spec)
@@ -1021,9 +1043,9 @@ printf '%s\n' "$*" > "$LIL_TEST_HF_LOG"
 	t.Setenv("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 	t.Setenv("LIL_TEST_HF_LOG", logPath)
 	spec := LaunchSpec{
-		Topology:             Topology{Local: &LocalTopology{Python: filepath.Join(bin, "python")}},
-		DownloadRepositories: []string{"local-inference-lab/Test-Model"},
-		UnsetEnvironment:     []string{"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"},
+		Topology:         Topology{Local: &LocalTopology{Python: filepath.Join(bin, "python")}},
+		Downloads:        []RepositoryDownload{{Repository: "local-inference-lab/Test-Model", Revision: testCommit}},
+		UnsetEnvironment: []string{"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"},
 	}
 	if err := SyncHuggingFaceCache(context.Background(), spec); err != nil {
 		t.Fatal(err)
@@ -1032,7 +1054,7 @@ printf '%s\n' "$*" > "$LIL_TEST_HF_LOG"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(string(data)); got != "download local-inference-lab/Test-Model" {
+	if got := strings.TrimSpace(string(data)); got != "download local-inference-lab/Test-Model --revision "+testCommit {
 		t.Fatalf("hf arguments: %q", got)
 	}
 }
@@ -1044,7 +1066,7 @@ func TestMissingHuggingFaceCLIDoesNotBlockLaunch(t *testing.T) {
 		Topology: Topology{Local: &LocalTopology{
 			Python: filepath.Join(directory, "missing", "python"),
 		}},
-		DownloadRepositories: []string{"local-inference-lab/Test-Model"},
+		Downloads: []RepositoryDownload{{Repository: "local-inference-lab/Test-Model"}},
 	}
 	if err := SyncHuggingFaceCache(context.Background(), spec); err != nil {
 		t.Fatalf("missing hf CLI blocked launch: %v", err)
@@ -1065,7 +1087,7 @@ func TestHuggingFaceDownloadFailureBlocksLaunch(t *testing.T) {
 		Topology: Topology{Local: &LocalTopology{
 			Python: filepath.Join(bin, "python"),
 		}},
-		DownloadRepositories: []string{"local-inference-lab/Test-Model"},
+		Downloads: []RepositoryDownload{{Repository: "local-inference-lab/Test-Model"}},
 	}
 	err := SyncHuggingFaceCache(context.Background(), spec)
 	if err == nil || !strings.Contains(err.Error(), "download failed") {
@@ -1136,5 +1158,190 @@ func TestShellAndJSONRenderExposeResolvedCommand(t *testing.T) {
 	sparkShell := ShellRender(sparkSpec)
 	if !strings.Contains(sparkShell, "ServerAliveInterval=15") || strings.Count(sparkShell, "ssh ") != 2 {
 		t.Fatalf("unexpected Spark shell render:\n%s", sparkShell)
+	}
+}
+
+func TestCatalogManifestNamesUpstreamAndPinsRemoteCode(t *testing.T) {
+	config := loadTestConfig(t)
+	deepseek := config.profiles[deepseekProfile]
+	if deepseek.Model != "deepseek-ai/DeepSeek-V4-Flash-0731" || deepseek.Revision != deepseekRevision ||
+		deepseek.Family != "deepseek-v4" || !deepseek.Serving.TrustRemoteCode {
+		t.Fatalf("catalog identity: %+v", deepseek)
+	}
+	unpinned := "schema_version: 1\nkind: model\nmodel: deepseek-ai/DeepSeek-V4-Flash\ndescription: x\nserving: {served_model_name: x, trust_remote_code: true}\n"
+	if _, err := LoadCatalogModelProfile(config.families, []byte(unpinned), "Unpinned", testCommit, "lil.yaml"); err == nil ||
+		!strings.Contains(err.Error(), "pin a revision") {
+		t.Fatalf("unpinned remote-code entry: %v", err)
+	}
+	safe := "schema_version: 1\nkind: model\nmodel: someone/Model\ndescription: x\nserving: {served_model_name: x}\n"
+	profile, err := LoadCatalogModelProfile(config.families, []byte(safe), "Safe", testCommit, "lil.yaml")
+	if err != nil || profile.Model != "someone/Model" || profile.Revision != "" {
+		t.Fatalf("unpinned entry without remote code: %+v %v", profile, err)
+	}
+	missing := "schema_version: 1\nkind: model\ndescription: x\nserving: {served_model_name: x}\n"
+	if _, err := LoadCatalogModelProfile(config.families, []byte(missing), "Missing", testCommit, "lil.yaml"); err == nil ||
+		!strings.Contains(err.Error(), "model must name") {
+		t.Fatalf("catalog entry without model: %v", err)
+	}
+	restated := "schema_version: 1\nkind: model\nmodel: a/b\nrevision: " + testCommit + "\ndescription: x\nserving: {served_model_name: x}\n"
+	if _, err := loadManifest(t, config.families, "Owned", restated); err == nil || !strings.Contains(err.Error(), "must not set model") {
+		t.Fatalf("repository manifest with model: %v", err)
+	}
+}
+
+func TestDeepSeekDSparkLaunchMatchesTheShellLauncher(t *testing.T) {
+	config := loadTestConfig(t)
+	spec, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, defaultOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := spec.VLLMArgv
+	if argv[3] != "serve" || argv[4] != "deepseek-ai/DeepSeek-V4-Flash-0731" || argv[5] != "--revision" || argv[6] != deepseekRevision {
+		t.Fatalf("model and revision must lead the serve argv: %v", argv[:8])
+	}
+	for flag, want := range map[string]string{
+		"--served-model-name":               "DeepSeek-V4-Flash-0731",
+		"--tokenizer-mode":                  "deepseek_v4",
+		"--tool-call-parser":                "deepseek_v4",
+		"--reasoning-parser":                "deepseek_v4",
+		"--kv-cache-dtype":                  "fp8",
+		"--block-size":                      "256",
+		"--load-format":                     "instanttensor",
+		"--attention-backend":               "B12X",
+		"--moe-backend":                     "b12x",
+		"--linear-backend":                  "b12x",
+		"--max-num-seqs":                    "16",
+		"--max-num-batched-tokens":          "8192",
+		"--max-model-len":                   "auto",
+		"--prefix-cache-retention-interval": "4096",
+	} {
+		if got := optionValue(t, argv, flag); got != want {
+			t.Errorf("%s: got %q, want %q", flag, got, want)
+		}
+	}
+	for _, flag := range []string{
+		"--trust-remote-code", "--async-scheduling", "--no-scheduler-reserve-full-isl",
+		"--enable-chunked-prefill", "--enable-prefix-caching", "--enable-auto-tool-choice",
+		"--enable-prompt-tokens-details", "--enable-force-include-usage",
+		"--enable-request-id-headers", "--enable-flashinfer-autotune",
+		"--default-chat-template-kwargs.thinking=true",
+		"--default-chat-template-kwargs.reasoning_effort=high",
+	} {
+		if !slices.Contains(argv, flag) {
+			t.Errorf("argv is missing %s", flag)
+		}
+	}
+	if slices.Contains(argv, "--quantization") || slices.Contains(argv, "--max-cudagraph-capture-size") {
+		t.Errorf("argv carries a flag the checkpoint or capture list already implies: %v", argv)
+	}
+	speculative := speculativeConfigValue(t, spec)
+	if speculative["method"] != "dspark" || speculative["model"] != "deepseek-ai/DeepSeek-V4-Flash-0731" ||
+		speculative["revision"] != deepseekRevision || speculative["num_speculative_tokens"] != float64(7) ||
+		speculative["draft_sample_method"] != "probabilistic" || speculative["rejection_sample_method"] != "standard" ||
+		speculative["enable_adaptive_verification"] != nil {
+		t.Fatalf("DSpark speculative config: %+v", speculative)
+	}
+	var compilation map[string]any
+	if err := json.Unmarshal([]byte(optionValue(t, argv, "--compilation-config")), &compilation); err != nil {
+		t.Fatal(err)
+	}
+	sizes := compilation["cudagraph_capture_sizes"].([]any)
+	if sizes[len(sizes)-1] != float64(128) {
+		t.Fatalf("DSpark capture sizes must stop at max_num_seqs times K+1: %v", sizes)
+	}
+	for name, want := range map[string]string{
+		"VLLM_B12X_MOE_FP4_FORCE_A16":              "0",
+		"VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
+		"VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD":   "1024",
+	} {
+		if got := spec.RuntimeEnvironment[name]; got != want {
+			t.Errorf("%s: got %q, want %q", name, got, want)
+		}
+	}
+	if !reflect.DeepEqual(spec.Downloads, []RepositoryDownload{{Repository: "deepseek-ai/DeepSeek-V4-Flash-0731", Revision: deepseekRevision}}) {
+		t.Fatalf("pinned download: %+v", spec.Downloads)
+	}
+	if spec.Metadata["speculator"] != "dspark" || spec.Metadata["revision"] != deepseekRevision {
+		t.Fatalf("metadata: %+v", spec.Metadata)
+	}
+}
+
+func TestDeepSeekOverridesFollowTheSpeculator(t *testing.T) {
+	config := loadTestConfig(t)
+	for _, test := range []struct {
+		speculator string
+		seqs       string
+		lastSize   float64
+		hasSpec    bool
+	}{
+		{"dspark", "16", 128, true},
+		{"mtp", "64", 512, true},
+		{"none", "64", 128, false},
+	} {
+		options := defaultOptions(2)
+		options.Speculator = stringPointerTest(test.speculator)
+		spec, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options)
+		if err != nil {
+			t.Fatalf("%s: %v", test.speculator, err)
+		}
+		if got := optionValue(t, spec.VLLMArgv, "--max-num-seqs"); got != test.seqs {
+			t.Errorf("%s: max-num-seqs %s, want %s", test.speculator, got, test.seqs)
+		}
+		var compilation map[string]any
+		if err := json.Unmarshal([]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")), &compilation); err != nil {
+			t.Fatal(err)
+		}
+		sizes := compilation["cudagraph_capture_sizes"].([]any)
+		if sizes[len(sizes)-1] != test.lastSize {
+			t.Errorf("%s: largest capture size %v, want %v", test.speculator, sizes[len(sizes)-1], test.lastSize)
+		}
+		if slices.Contains(spec.VLLMArgv, "--speculative-config") != test.hasSpec {
+			t.Errorf("%s: speculative config presence %v", test.speculator, !test.hasSpec)
+		}
+		if test.speculator == "mtp" {
+			speculative := speculativeConfigValue(t, spec)
+			if speculative["moe_backend"] != "b12x" || speculative["revision"] != nil || speculative["rejection_sample_method"] != "standard" {
+				t.Errorf("MTP speculative config: %+v", speculative)
+			}
+		}
+	}
+	options := defaultOptions(2)
+	options.AdaptiveVerification = true
+	spec, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speculativeConfigValue(t, spec)["enable_adaptive_verification"] != true {
+		t.Fatalf("adaptive verification switch was not applied")
+	}
+	options.Speculator = stringPointerTest("mtp")
+	if _, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options); err == nil || !strings.Contains(err.Error(), "only for DSpark") {
+		t.Fatalf("adaptive verification on MTP: %v", err)
+	}
+}
+
+func TestBlockFP8CheckpointDerivesExpertQuantization(t *testing.T) {
+	config := map[string]any{
+		"architectures":       []any{"DeepseekV4ForCausalLM"},
+		"num_attention_heads": float64(64),
+		"expert_dtype":        "fp8",
+		"quantization_config": map[string]any{"quant_method": "fp8", "weight_block_size": []any{float64(128), float64(128)}},
+	}
+	_, err := MTPMoEBackendFromConfig(config, "bfloat16")
+	if err == nil || !strings.Contains(err.Error(), "moe_backend") {
+		t.Fatalf("FP8 experts must require an explicit backend: %v", err)
+	}
+	delete(config, "expert_dtype")
+	decision, err := MTPMoEBackendFromConfig(config, "bfloat16")
+	if err != nil || decision.Quantization != "mxfp4" || decision.Backend != "b12x" {
+		t.Fatalf("default fp4 experts: %+v %v", decision, err)
+	}
+	backend := "triton"
+	facts := &CheckpointFacts{Source: "test", Config: map[string]any{
+		"quantization_config": map[string]any{"quant_method": "fp8"}, "expert_dtype": "fp8",
+	}}
+	decision, err = mtpBackendDecision(MTPPolicy{MoEBackend: &backend}, facts, "bfloat16")
+	if err != nil || decision.Backend != "triton" || decision.Quantization != "fp8" {
+		t.Fatalf("declared backend: %+v %v", decision, err)
 	}
 }

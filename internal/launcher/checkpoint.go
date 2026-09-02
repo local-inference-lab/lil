@@ -27,11 +27,13 @@ type MTPMoEBackendDecision struct {
 func MTPMoEBackendFromQuantization(quantization, evidence string) (MTPMoEBackendDecision, error) {
 	backend, ok := map[string]string{
 		"nvfp4": "b12x",
+		"mxfp4": "b12x",
 		"mxfp8": "triton",
 		"bf16":  "triton",
 	}[quantization]
 	if !ok {
-		return MTPMoEBackendDecision{}, fmt.Errorf("unsupported MTP MoE quantization %q", quantization)
+		return MTPMoEBackendDecision{Quantization: quantization, Evidence: []string{evidence}},
+			fmt.Errorf("no default MTP MoE backend for quantization %q; declare speculators.mtp.moe_backend", quantization)
 	}
 	return MTPMoEBackendDecision{quantization, backend, []string{evidence}}, nil
 }
@@ -296,6 +298,10 @@ func normalizeQuantization(value any) string {
 		return "nvfp4"
 	case strings.Contains(normalized, "mxfp8"):
 		return "mxfp8"
+	case strings.Contains(normalized, "mxfp4"), normalized == "fp4":
+		return "mxfp4"
+	case normalized == "fp8", normalized == "e4m3", normalized == "float8e4m3fn":
+		return "fp8"
 	case normalized == "bf16" || normalized == "bfloat16":
 		return "bf16"
 	default:
@@ -347,6 +353,28 @@ func unquantizedMTPDecision(config map[string]any, defaultDType string) (MTPMoEB
 	return MTPMoEBackendDecision{"bf16", "triton", []string{fmt.Sprintf("no quantized MTP expert target; dtype=%v", dtype)}}, nil
 }
 
+// blockFP8CheckpointDecision handles checkpoints whose quantization_config
+// declares block-scaled FP8 for every projection and an expert_dtype for the
+// MoE experts, the layout DeepSeek publishes. The MTP experts share the
+// routed experts' format.
+func blockFP8CheckpointDecision(config, quantizationConfig map[string]any) (MTPMoEBackendDecision, bool, error) {
+	method, _ := quantizationConfig["quant_method"].(string)
+	if strings.ToLower(method) != "fp8" {
+		return MTPMoEBackendDecision{}, false, nil
+	}
+	expertDType := "fp4"
+	if value, ok := config["expert_dtype"].(string); ok && value != "" {
+		expertDType = value
+	}
+	quantization := normalizeQuantization(expertDType)
+	if quantization == "" {
+		return MTPMoEBackendDecision{}, false, nil
+	}
+	evidence := fmt.Sprintf("quantization_config.quant_method=fp8 with expert_dtype=%s", expertDType)
+	decision, err := MTPMoEBackendFromQuantization(quantization, evidence)
+	return decision, true, err
+}
+
 // MTPMoEBackendFromConfig decides the MTP expert kernel backend from the
 // quantization metadata of a parsed config.json.
 func MTPMoEBackendFromConfig(config map[string]any, defaultDType string) (MTPMoEBackendDecision, error) {
@@ -387,6 +415,9 @@ func MTPMoEBackendFromConfig(config map[string]any, defaultDType string) (MTPMoE
 		}
 	}
 	if len(findings) == 0 {
+		if decision, ok, err := blockFP8CheckpointDecision(config, quantizationConfig); ok {
+			return decision, err
+		}
 		return unquantizedMTPDecision(config, defaultDType)
 	}
 	unknown := []string{}

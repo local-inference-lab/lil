@@ -214,27 +214,32 @@ The sections:
 - `family` names one entry in the embedded families file. Family mappings
   merge under the manifest; a scalar, list, or explicit `null` in the manifest
   replaces the family value.
-- `serving` holds the API-facing policy: served name, remote code, parsers,
-  tool choice, generation config, scheduler switches, and multimodal limits.
-  `auto_tool_choice` defaults to true when a tool parser is set. Prefix caching
-  and chunked prefill default to on. A manifest without parsers or a tool
-  parser emits none of those flags.
+- `serving` holds the API-facing policy: served name, remote code, tokenizer
+  mode, parsers, tool choice, generation config, default chat-template
+  arguments, scheduler switches, prefix-cache retention, usage and request-ID
+  reporting, and multimodal limits. `auto_tool_choice` defaults to true when a
+  tool parser is set. Prefix caching and chunked prefill default to on. A
+  manifest without parsers or a tool parser emits none of those flags.
 - `kernels` holds dtype, quantization, attention, linear, MoE, and GDN decode
   backends, block size, Mamba cache mode, FlashInfer autotuning, and the weight
   loader. Defaults are bfloat16, the B12X linear and MoE backends, and the
   instanttensor loader.
-- `speculators` names a `default` of `mtp`, `dflash`, or `none` (the default)
-  and a section per method. `mtp.moe_quantization` is an assertion checked
-  against the checkpoint; it is required only when the checkpoint metadata
-  cannot decide. NVFP4 experts use the B12X backend, MXFP8 and BF16 use Triton.
+- `speculators` names a `default` of `mtp`, `dflash`, `dspark`, or `none`
+  (the default) and a section per method. `mtp.moe_quantization` is an
+  assertion checked against the checkpoint; it is required only when the
+  checkpoint metadata cannot decide, and `mtp.moe_backend` overrides the
+  backend the quantization implies. NVFP4 and MXFP4 experts use the B12X
+  backend, MXFP8 and BF16 use Triton, and block-FP8 experts need an explicit
+  backend. A DSpark draft always ships inside the target checkpoint.
 - `capacity`, `compilation`, and `environment` are the base launch layer.
   Capacity defaults are `max_model_len: auto`, eight sequences, and 4096
   batched tokens. A compilation mapping enables `--compilation-config` with
   computed CUDA graph capture sizes.
 - `overrides` is an ordered list of layers applied when every condition in
   `when` matches the launch. Conditions are `kind` (`local` or `spark_rdma`),
-  `arch` (the topology's CuTe DSL architecture, such as `sm_121a`), and `tp`.
-  Later overrides win.
+  `arch` (the topology's CuTe DSL architecture, such as `sm_121a`), `tp`, and
+  `speculator` (the method that actually runs, with a zero-depth launch
+  counting as `none`). Later overrides win.
 - `requires.arch` lists the architectures a checkpoint may run on. A launch on
   any other topology fails, and `lil list` marks the topology.
 
@@ -251,11 +256,54 @@ compatible_models:
   - local-inference-lab/GLM-5.3-Flash-NVFP4
 ```
 
+## External models
+
+A model whose weights live in another account gets its manifest from the
+catalog repository `local-inference-lab/lil-catalog`, which holds one
+`<model>/lil.yaml` per entry. The entry name is the launch name. The manifest
+names the upstream repository and, because a third-party head is not a
+trusted input, may pin it:
+
+```yaml
+schema_version: 1
+kind: model
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+family: deepseek-v4
+description: DeepSeek V4 Flash 0731 with block-FP8 projections, MXFP4 routed experts, and a DSpark draft head
+serving:
+  served_model_name: DeepSeek-V4-Flash-0731
+speculators:
+  default: dspark
+  dspark:
+    tokens: 7
+    model: target
+    draft_sample_method: probabilistic
+    rejection_sample_method: standard
+capacity:
+  max_num_seqs: 16
+  max_num_batched_tokens: 8192
+overrides:
+  - when:
+      speculator: none
+    capacity:
+      max_num_seqs: 64
+```
+
+`revision` is required whenever the entry enables `trust_remote_code`. A
+pinned entry emits `--revision` on the serve command, downloads that commit,
+reads its checkpoint facts at that commit, and carries the pin into a
+speculative config whose draft lives in the target checkpoint. An unpinned
+entry follows the upstream head like an owned repository. A launch name that
+is both an owned repository and a catalog entry fails closed.
+
 `--models-config DIRECTORY` reads manifests from `<model>/lil.yaml` under a
 local directory, with each model's `config.json` and
 `model.safetensors.index.json` beside the manifest, for development and tests.
-The fixtures under `internal/launcher/testdata/model-manifests` are the
-reference copies of the published manifests. Unknown keys, missing families,
+An entry with a `model` field is a catalog entry; one without is a
+repository-rooted manifest. The fixtures under
+`internal/launcher/testdata/model-manifests` are the reference copies of the
+published manifests and catalog entries. Unknown keys, missing families,
 inheritance cycles, and invalid types fail closed.
 
 ## Policy ownership
@@ -277,8 +325,10 @@ large enough; Spark launches take the first N one-GPU ranks.
 
 CUDA graph capture sizes are calculated from resolved scheduler and speculation
 settings. The set contains mixed batch sizes and every uniform decode batch
-through `max_num_seqs`; with MTP depth K, uniform verification shapes are
-sequence count multiplied by K+1.
+through `max_num_seqs`; with MTP or DSpark depth K, uniform verification
+shapes are sequence count multiplied by K+1. The mixed ladder extends to twice
+the uniform maximum, except for DSpark, whose verifier never exceeds one
+sampled token plus its drafts per request.
 
 ## Capacity
 

@@ -17,3 +17,35 @@ families:
       mamba_cache_mode: align
     environment:
       VLLM_SSM_CONV_STATE_LAYOUT: DS
+
+  # DeepSeek V4 checkpoints on the SM120 PCIe stack: block-FP8 projections
+  # with MXFP4 routed experts served through the B12X attention, linear, and
+  # MoE backends, the deepseek_v4 tokenizer and parsers, and thinking enabled
+  # by default in the chat template.
+  deepseek-v4:
+    serving:
+      trust_remote_code: true
+      tokenizer_mode: deepseek_v4
+      reasoning_parser: deepseek_v4
+      tool_call_parser: deepseek_v4
+      async_scheduling: true
+      scheduler_reserve_full_isl: false
+      prefix_cache_retention_interval: 4096
+      prompt_tokens_details: true
+      force_include_usage: true
+      request_id_headers: true
+      chat_template_kwargs:
+        thinking: true
+        reasoning_effort: high
+    kernels:
+      attention: B12X
+      block_size: 256
+      flashinfer_autotune: true
+    compilation:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      custom_ops:
+        - all
+    environment:
+      VLLM_B12X_MOE_FP4_FORCE_A16: "0"
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "1"
+      VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: "1024"

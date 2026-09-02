@@ -105,30 +105,31 @@ type sparkNodeJSON struct {
 }
 
 type launchSpecJSON struct {
-	Model                string            `json:"model"`
-	Repository           string            `json:"repository"`
-	ManifestCommit       string            `json:"manifest_commit"`
-	Family               string            `json:"family"`
-	ModelSource          string            `json:"model_source"`
-	CheckpointPath       *string           `json:"checkpoint_path"`
-	ServedModelName      string            `json:"served_model_name"`
-	Topology             string            `json:"topology"`
-	TopologyKind         string            `json:"topology_kind"`
-	TensorParallelSize   int               `json:"tensor_parallel_size"`
-	DeviceIDs            []int             `json:"device_ids"`
-	Host                 string            `json:"host"`
-	Port                 int               `json:"port"`
-	Detach               bool              `json:"detach"`
-	SyncCode             bool              `json:"sync_code"`
-	SyncModel            bool              `json:"sync_model"`
-	DownloadRepositories []string          `json:"download_repositories"`
-	UnsetEnvironment     []string          `json:"unset_environment"`
-	RuntimeEnvironment   map[string]string `json:"runtime_environment"`
-	HostEnvironment      map[string]string `json:"host_environment"`
-	VLLMArgv             []string          `json:"vllm_argv"`
-	CommandArgv          []string          `json:"command_argv"`
-	SparkNodes           []sparkNodeJSON   `json:"spark_nodes"`
-	Metadata             map[string]any    `json:"metadata"`
+	Model              string               `json:"model"`
+	Repository         string               `json:"repository"`
+	Revision           string               `json:"revision,omitempty"`
+	ManifestCommit     string               `json:"manifest_commit"`
+	Family             string               `json:"family"`
+	ModelSource        string               `json:"model_source"`
+	CheckpointPath     *string              `json:"checkpoint_path"`
+	ServedModelName    string               `json:"served_model_name"`
+	Topology           string               `json:"topology"`
+	TopologyKind       string               `json:"topology_kind"`
+	TensorParallelSize int                  `json:"tensor_parallel_size"`
+	DeviceIDs          []int                `json:"device_ids"`
+	Host               string               `json:"host"`
+	Port               int                  `json:"port"`
+	Detach             bool                 `json:"detach"`
+	SyncCode           bool                 `json:"sync_code"`
+	SyncModel          bool                 `json:"sync_model"`
+	Downloads          []RepositoryDownload `json:"downloads"`
+	UnsetEnvironment   []string             `json:"unset_environment"`
+	RuntimeEnvironment map[string]string    `json:"runtime_environment"`
+	HostEnvironment    map[string]string    `json:"host_environment"`
+	VLLMArgv           []string             `json:"vllm_argv"`
+	CommandArgv        []string             `json:"command_argv"`
+	SparkNodes         []sparkNodeJSON      `json:"spark_nodes"`
+	Metadata           map[string]any       `json:"metadata"`
 }
 
 func JSONRender(spec LaunchSpec) ([]byte, error) {
@@ -151,13 +152,14 @@ func JSONRender(spec LaunchSpec) ([]byte, error) {
 	}
 	return json.MarshalIndent(launchSpecJSON{
 		Model: spec.Model.Name, Repository: spec.Model.Model,
+		Revision:       spec.Model.Revision,
 		ManifestCommit: spec.Model.ManifestCommit, Family: spec.Model.Family,
 		ModelSource:    spec.ModelSource,
 		CheckpointPath: spec.CheckpointPath, ServedModelName: spec.ServedModelName,
 		Topology: spec.Topology.Name(), TopologyKind: spec.Topology.Kind,
 		TensorParallelSize: spec.TPSize, DeviceIDs: deviceIDs,
 		Host: spec.Host, Port: spec.Port, Detach: spec.Detach, SyncCode: spec.SyncCode,
-		SyncModel: spec.SyncModel, DownloadRepositories: spec.DownloadRepositories,
+		SyncModel: spec.SyncModel, Downloads: spec.Downloads,
 		UnsetEnvironment: unset, RuntimeEnvironment: spec.RuntimeEnvironment,
 		HostEnvironment: spec.HostEnvironment, VLLMArgv: spec.VLLMArgv,
 		CommandArgv: spec.CommandArgv, SparkNodes: nodes, Metadata: spec.Metadata,

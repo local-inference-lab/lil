@@ -31,8 +31,16 @@ var (
 	repositoryIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 	revisionPattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	nextLinkPattern     = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
-	repositoryFilePath  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	repositoryFilePath  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9][A-Za-z0-9_.-]*)?$`)
 )
+
+// CatalogRepositoryName is the repository under the owner that holds one
+// <model>/lil.yaml manifest per model whose weights live in another
+// account.
+const CatalogRepositoryName = "lil-catalog"
+
+// ErrNotFound reports a repository or revision the Hub does not have.
+var ErrNotFound = errors.New("not found")
 
 type Sibling struct {
 	Filename string `json:"rfilename"`
@@ -65,6 +73,20 @@ func (repository Repository) HasSizes() bool {
 		}
 	}
 	return false
+}
+
+// CatalogEntries lists the model names that have a <name>/lil.yaml manifest
+// in this repository.
+func (repository Repository) CatalogEntries() []string {
+	entries := []string{}
+	for _, sibling := range repository.Siblings {
+		directory, file, ok := strings.Cut(sibling.Filename, "/")
+		if ok && file == "lil.yaml" && !strings.Contains(directory, "/") {
+			entries = append(entries, directory)
+		}
+	}
+	sort.Strings(entries)
+	return entries
 }
 
 func (repository Repository) sizes() map[string]int64 {
@@ -172,6 +194,9 @@ func (client *Client) request(ctx context.Context, method, target string) (*http
 }
 
 func responseError(response *http.Response) error {
+	if response.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
 	message := strings.TrimSpace(response.Header.Get("X-Error-Message"))
 	if message == "" {
 		data, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
@@ -309,7 +334,8 @@ func (client *Client) NormalizeRepository(model string) (string, error) {
 	return model, nil
 }
 
-// Resolve fetches the repository's head commit and file listing with sizes.
+// Resolve fetches an owned repository's head commit and file listing with
+// sizes.
 func (client *Client) Resolve(ctx context.Context, model string) (Repository, error) {
 	id, err := client.NormalizeRepository(model)
 	if err != nil {
@@ -318,8 +344,32 @@ func (client *Client) Resolve(ctx context.Context, model string) (Repository, er
 	if client.Offline {
 		return client.resolveCached(id)
 	}
+	repository, err := client.ResolveAt(ctx, id, "")
+	if err != nil {
+		return Repository{}, err
+	}
+	client.mergeCatalog(repository)
+	return repository, nil
+}
+
+// ResolveAt fetches the listing of any public or accessible repository at
+// its head, or at a pinned commit when revision is set. Sizes are included.
+func (client *Client) ResolveAt(ctx context.Context, id, revision string) (Repository, error) {
+	if !repositoryIDPattern.MatchString(id) {
+		return Repository{}, fmt.Errorf("repository must have owner/name form; got %q", id)
+	}
+	if revision != "" && !revisionPattern.MatchString(revision) {
+		return Repository{}, fmt.Errorf("revision for %s must be a 40-character commit SHA", id)
+	}
+	if client.Offline {
+		return Repository{}, fmt.Errorf("Hugging Face is offline; cannot resolve %s", id)
+	}
 	owner, name, _ := strings.Cut(id, "/")
-	target := client.endpoint() + "/api/models/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "?blobs=true"
+	target := client.endpoint() + "/api/models/" + url.PathEscape(owner) + "/" + url.PathEscape(name)
+	if revision != "" {
+		target += "/revision/" + revision
+	}
+	target += "?blobs=true"
 	response, err := client.request(ctx, http.MethodGet, target)
 	if err != nil {
 		return Repository{}, fmt.Errorf("cannot resolve Hugging Face repository %s: %w", id, err)
@@ -335,7 +385,9 @@ func (client *Client) Resolve(ctx context.Context, model string) (Repository, er
 	if err := validateRepository(repository, id); err != nil {
 		return Repository{}, err
 	}
-	client.mergeCatalog(repository)
+	if revision != "" && repository.Revision != revision {
+		return Repository{}, fmt.Errorf("Hugging Face resolved %s@%s to %s", id, revision[:12], repository.Revision[:12])
+	}
 	if repository.HasSizes() {
 		_ = client.writeSizes(repository)
 	}

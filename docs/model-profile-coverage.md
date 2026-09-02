@@ -3,8 +3,10 @@
 Model coverage is dynamic. A repository is launchable when it belongs to the
 `local-inference-lab` Hugging Face account, its root `lil.yaml` has
 `kind: model`, and its `config.json` and safetensors shards are readable at the
-repository's head commit. `lil list` is the authoritative inventory and shows
-the default tensor-parallel size on every discovered topology.
+repository's head commit. A model published by another account is launchable
+when the catalog repository `local-inference-lab/lil-catalog` holds a
+`<model>/lil.yaml` entry naming it. `lil list` is the authoritative inventory
+and shows the default tensor-parallel size on every discovered topology.
 
 Repositories with `kind: draft` describe speculative-decoding checkpoints.
 They are validated during discovery but are not listed as serving targets. A
@@ -19,6 +21,7 @@ in a family.
 
 A manifest contains only what the checkpoint cannot state about itself:
 
+- for a catalog entry, the upstream repository and its pinned commit;
 - the family, when one applies;
 - the served model name and API-facing serving policy;
 - kernel and loader selection that differs from the launcher defaults;
@@ -57,3 +60,27 @@ When a launcher in a vLLM working tree carries policy not represented by an
 existing family, the missing behavior belongs in the typed Go builder or a
 family. Copying a shell launcher into a large model-specific manifest is
 unsupported.
+
+## DeepSeek V4 Flash
+
+The `deepseek-v4` family reproduces the SM120 PCIe policy of the
+`serve-ds4-flash.sh` launcher in the vLLM working tree: the `deepseek_v4`
+tokenizer and parsers, thinking enabled in the chat template, full-graph
+compilation, FlashInfer autotuning, the B12X attention backend, and the
+MegaMoE and multi-stream GEMM environment. Two catalog entries use it.
+
+- `DeepSeek-V4-Flash-0731` is pinned to the release commit the shell launcher
+  pins. The DSpark draft head inside the checkpoint is the default speculator
+  at depth 7; `--speculator mtp` or `none` switch to the 64-sequence capacity
+  profile. Status: implemented, preflight-qualified against the installed
+  parser, not yet served through `lil`.
+- `DeepSeek-V4-Flash-Vision-Exp` carries the same text policy pinned to its
+  first published commit. This vLLM tree registers no vision tower for the V4
+  architecture, so the entry serves the text model only and its vision weights
+  are outside the launcher's contract. Status: research-only.
+
+The shell launcher raises GPU memory utilization to 0.975 for DSpark and
+serves a fixed 131072-token context; the catalog entries keep the topology's
+utilization and `max_model_len: auto`, so the runtime profile sizes the KV
+cache. Pass `--gpu-memory-utilization` and `--max-model-len` to reproduce the
+script's fixed profile.

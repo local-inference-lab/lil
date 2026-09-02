@@ -45,7 +45,9 @@ func TestListShowsFactsAndPerTopologyDefaults(t *testing.T) {
 	}
 	output := ansi.Strip(renderList(profiles))
 	for _, want := range []string{
-		"Models  5\n\n",
+		"Models  7\n\n",
+		"DeepSeek-V4-Flash-0731",
+		"155.4 GiB stored  ·  family deepseek-v4  ·  speculator dspark",
 		"GLM-5.3-NVFP4",
 		"GLM-5.3-NVFP4-Spark",
 		"GLM-5.3 with NVFP4 routed experts",

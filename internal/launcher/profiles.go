@@ -15,6 +15,7 @@ import (
 
 var hfModelID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 var hfCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var hfRepositoryName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Launcher-wide defaults that any manifest section may override.
@@ -29,6 +30,8 @@ const (
 var capacityKeys = []string{
 	"kv_cache_memory_bytes", "max_model_len", "max_num_seqs", "max_num_batched_tokens",
 }
+
+var speculatorMethods = stringSet("mtp", "dflash", "dspark", "none")
 
 var manifestSections = []string{
 	"description", "serving", "kernels", "speculators", "capacity",
@@ -283,6 +286,17 @@ func (s section) boolOr(key string, fallback bool) (bool, error) {
 	return value, nil
 }
 
+func (s section) optionalBool(key string) (*bool, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	value, ok := s.data[key].(bool)
+	if !ok {
+		return nil, fmt.Errorf("%s.%s must be a boolean or null", s.context, key)
+	}
+	return &value, nil
+}
+
 func (s section) optionalPositiveInt(key string) (*int, error) {
 	if !s.present(key) {
 		return nil, nil
@@ -453,9 +467,12 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 		return ServingPolicy{}, fmt.Errorf("%s.serving is required", context)
 	}
 	if err := checkKeys(s.data, s.context, []string{"served_model_name"}, []string{
-		"trust_remote_code", "reasoning_parser", "tool_call_parser", "auto_tool_choice",
-		"generation_config", "hf_overrides", "async_scheduling", "prefix_caching",
-		"chunked_prefill", "long_prefill_token_threshold", "multimodal",
+		"trust_remote_code", "tokenizer_mode", "reasoning_parser", "tool_call_parser",
+		"auto_tool_choice", "generation_config", "hf_overrides", "chat_template_kwargs",
+		"async_scheduling", "scheduler_reserve_full_isl", "prefix_caching",
+		"prefix_cache_retention_interval", "chunked_prefill",
+		"long_prefill_token_threshold", "prompt_tokens_details", "force_include_usage",
+		"request_id_headers", "multimodal",
 	}); err != nil {
 		return ServingPolicy{}, err
 	}
@@ -467,6 +484,9 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 		return policy, fmt.Errorf("%s.served_model_name must be a non-empty string", s.context)
 	}
 	if policy.TrustRemoteCode, err = s.boolOr("trust_remote_code", false); err != nil {
+		return policy, err
+	}
+	if policy.TokenizerMode, err = s.stringOr("tokenizer_mode", ""); err != nil {
 		return policy, err
 	}
 	if policy.ReasoningParser, err = s.stringOr("reasoning_parser", ""); err != nil {
@@ -487,16 +507,41 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 	if policy.HFOverrides, err = s.optionalMapping("hf_overrides"); err != nil {
 		return policy, err
 	}
+	if policy.ChatTemplateKwargs, err = s.optionalMapping("chat_template_kwargs"); err != nil {
+		return policy, err
+	}
+	for key, value := range policy.ChatTemplateKwargs {
+		switch value.(type) {
+		case string, bool, int, float64:
+		default:
+			return policy, fmt.Errorf("%s.chat_template_kwargs.%s must be a string, boolean, or number", s.context, key)
+		}
+	}
 	if policy.AsyncScheduling, err = s.boolOr("async_scheduling", false); err != nil {
 		return policy, err
 	}
+	if policy.SchedulerReserveFullISL, err = s.boolOr("scheduler_reserve_full_isl", true); err != nil {
+		return policy, err
+	}
 	if policy.PrefixCaching, err = s.boolOr("prefix_caching", true); err != nil {
+		return policy, err
+	}
+	if policy.PrefixCacheRetentionInterval, err = s.optionalNonNegativeInt("prefix_cache_retention_interval"); err != nil {
 		return policy, err
 	}
 	if policy.ChunkedPrefill, err = s.boolOr("chunked_prefill", true); err != nil {
 		return policy, err
 	}
 	if policy.LongPrefillTokenThreshold, err = s.optionalPositiveInt("long_prefill_token_threshold"); err != nil {
+		return policy, err
+	}
+	if policy.PromptTokensDetails, err = s.boolOr("prompt_tokens_details", false); err != nil {
+		return policy, err
+	}
+	if policy.ForceIncludeUsage, err = s.boolOr("force_include_usage", false); err != nil {
+		return policy, err
+	}
+	if policy.RequestIDHeaders, err = s.boolOr("request_id_headers", false); err != nil {
 		return policy, err
 	}
 	multimodal, ok, err := subsection(s.data, "multimodal", s.context)
@@ -538,7 +583,7 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
 	policy := KernelPolicy{
 		DType: defaultDType, Linear: defaultLinear, MoE: defaultMoE,
-		FlashinferAutotune: true, LoadFormat: defaultLoadFormat,
+		LoadFormat: defaultLoadFormat,
 	}
 	s, ok, err := subsection(data, "kernels", context)
 	if err != nil || !ok {
@@ -575,7 +620,7 @@ func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
 	if policy.MambaCacheMode, err = s.optionalString("mamba_cache_mode"); err != nil {
 		return policy, err
 	}
-	if policy.FlashinferAutotune, err = s.boolOr("flashinfer_autotune", true); err != nil {
+	if policy.FlashinferAutotune, err = s.optionalBool("flashinfer_autotune"); err != nil {
 		return policy, err
 	}
 	if policy.LoadFormat, err = s.stringOr("load_format", defaultLoadFormat); err != nil {
@@ -593,14 +638,14 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 	if err != nil || !ok {
 		return policy, err
 	}
-	if err := checkKeys(s.data, s.context, nil, []string{"default", "mtp", "dflash"}); err != nil {
+	if err := checkKeys(s.data, s.context, nil, []string{"default", "mtp", "dflash", "dspark"}); err != nil {
 		return policy, err
 	}
 	if policy.Default, err = s.stringOr("default", "none"); err != nil {
 		return policy, err
 	}
-	if !stringSet("mtp", "dflash", "none")[policy.Default] {
-		return policy, fmt.Errorf("%s.default must be mtp, dflash, or none", s.context)
+	if !speculatorMethods[policy.Default] {
+		return policy, fmt.Errorf("%s.default must be mtp, dflash, dspark, or none", s.context)
 	}
 	mtp, ok, err := subsection(s.data, "mtp", s.context)
 	if err != nil {
@@ -608,7 +653,8 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 	}
 	if ok {
 		if err := checkKeys(mtp.data, mtp.context, nil, []string{
-			"tokens", "moe_quantization", "attention", "draft_sample_method", "model",
+			"tokens", "moe_quantization", "moe_backend", "attention",
+			"draft_sample_method", "rejection_sample_method", "model",
 		}); err != nil {
 			return policy, err
 		}
@@ -626,10 +672,16 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 				return policy, fmt.Errorf("%s.moe_quantization must be nvfp4, mxfp8, or bf16", mtp.context)
 			}
 		}
+		if settings.MoEBackend, err = mtp.optionalString("moe_backend"); err != nil {
+			return policy, err
+		}
 		if settings.Attention, err = mtp.optionalString("attention"); err != nil {
 			return policy, err
 		}
 		if settings.DraftSampleMethod, err = mtp.optionalString("draft_sample_method"); err != nil {
+			return policy, err
+		}
+		if settings.RejectionSampleMethod, err = mtp.optionalString("rejection_sample_method"); err != nil {
 			return policy, err
 		}
 		model, err := mtp.optionalString("model")
@@ -668,11 +720,53 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 		}
 		policy.DFlash = &DFlashPolicy{Tokens: *tokens, Model: model}
 	}
+	dspark, ok, err := subsection(s.data, "dspark", s.context)
+	if err != nil {
+		return policy, err
+	}
+	if ok {
+		if err := checkKeys(dspark.data, dspark.context, []string{"tokens", "model"}, []string{
+			"attention", "draft_sample_method", "rejection_sample_method", "adaptive_verification",
+		}); err != nil {
+			return policy, err
+		}
+		tokens, err := dspark.optionalNonNegativeInt("tokens")
+		if err != nil {
+			return policy, err
+		}
+		if tokens == nil {
+			return policy, fmt.Errorf("%s.tokens must be a non-negative integer", dspark.context)
+		}
+		model, err := dspark.stringOr("model", "")
+		if err != nil {
+			return policy, err
+		}
+		if model != "target" {
+			return policy, fmt.Errorf("%s.model must be target; DSpark drafts ship inside the target checkpoint", dspark.context)
+		}
+		settings := DSparkPolicy{Tokens: *tokens}
+		if settings.Attention, err = dspark.optionalString("attention"); err != nil {
+			return policy, err
+		}
+		if settings.DraftSampleMethod, err = dspark.optionalString("draft_sample_method"); err != nil {
+			return policy, err
+		}
+		if settings.RejectionSampleMethod, err = dspark.optionalString("rejection_sample_method"); err != nil {
+			return policy, err
+		}
+		if settings.AdaptiveVerification, err = dspark.boolOr("adaptive_verification", false); err != nil {
+			return policy, err
+		}
+		policy.DSpark = &settings
+	}
 	if policy.Default == "mtp" && policy.MTP == nil {
 		return policy, fmt.Errorf("%s.default is mtp but no mtp section is defined", s.context)
 	}
 	if policy.Default == "dflash" && policy.DFlash == nil {
 		return policy, fmt.Errorf("%s.default is dflash but no dflash section is defined", s.context)
+	}
+	if policy.Default == "dspark" && policy.DSpark == nil {
+		return policy, fmt.Errorf("%s.default is dspark but no dspark section is defined", s.context)
 	}
 	return policy, nil
 }
@@ -715,7 +809,7 @@ func parseOverrides(data map[string]any, context string) ([]LaunchOverride, erro
 		if err != nil {
 			return nil, err
 		}
-		if err := checkKeys(when, itemContext+".when", nil, []string{"kind", "arch", "tp"}); err != nil {
+		if err := checkKeys(when, itemContext+".when", nil, []string{"kind", "arch", "tp", "speculator"}); err != nil {
 			return nil, err
 		}
 		if len(when) == 0 {
@@ -738,6 +832,12 @@ func parseOverrides(data map[string]any, context string) ([]LaunchOverride, erro
 		}
 		if tp != nil {
 			override.When.TP = *tp
+		}
+		if override.When.Speculator, err = condition.stringOr("speculator", ""); err != nil {
+			return nil, err
+		}
+		if override.When.Speculator != "" && !speculatorMethods[override.When.Speculator] {
+			return nil, fmt.Errorf("%s.when.speculator must be mtp, dflash, dspark, or none", itemContext)
 		}
 		if override.Layer, err = parseLaunchLayer(entry, itemContext); err != nil {
 			return nil, err
@@ -789,8 +889,52 @@ func decodeProfile(name string, document map[string]any, context string) (ModelP
 	}, nil
 }
 
-// LoadRepositoryModelProfile parses a repository-rooted manifest. The
-// repository ID is the model identity; the manifest may not restate it.
+func loadFamilies(familiesData []byte) (map[string]map[string]any, error) {
+	return LoadFamilies(familiesData, "embedded model families")
+}
+
+// resolveManifestDocument validates the manifest envelope and merges the
+// named family under the manifest body. It returns the merged body and the
+// family name.
+func resolveManifestDocument(families map[string]map[string]any, manifestData []byte, label string, extraKeys []string) (map[string]any, map[string]any, string, error) {
+	document, err := parseYAMLDocument(manifestData, label)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if err := schemaVersionOf(document, label); err != nil {
+		return nil, nil, "", err
+	}
+	kind, ok := document["kind"].(string)
+	if !ok || kind != "model" {
+		return nil, nil, "", fmt.Errorf("%s.kind must be model", label)
+	}
+	optional := append([]string{"family"}, manifestSections...)
+	optional = append(optional, extraKeys...)
+	if err := checkKeys(document, label, []string{"schema_version", "kind"}, optional); err != nil {
+		return nil, nil, "", err
+	}
+	resolved := map[string]any{}
+	familyName := ""
+	if raw, exists := document["family"]; exists && raw != nil {
+		familyName, ok = raw.(string)
+		if !ok || familyName == "" {
+			return nil, nil, "", fmt.Errorf("%s.family must be a family name or null", label)
+		}
+		resolved, err = resolveFamily(families, familyName, nil)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("%s: %w", label, err)
+		}
+	}
+	overlay := cloneValue(document).(map[string]any)
+	for _, key := range append([]string{"schema_version", "kind", "family"}, extraKeys...) {
+		delete(overlay, key)
+	}
+	return document, deepMerge(resolved, overlay), familyName, nil
+}
+
+// LoadRepositoryModelProfile parses a manifest stored at the root of the
+// model's own repository. The repository ID is the model identity; the
+// manifest may not restate it or pin a revision.
 func LoadRepositoryModelProfile(
 	familiesData, manifestData []byte,
 	repositoryID, manifestCommit, label string,
@@ -801,7 +945,7 @@ func LoadRepositoryModelProfile(
 	if manifestCommit != "" && !hfCommit.MatchString(manifestCommit) {
 		return ModelProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", manifestCommit)
 	}
-	families, err := LoadFamilies(familiesData, "embedded model families")
+	families, err := loadFamilies(familiesData)
 	if err != nil {
 		return ModelProfile{}, err
 	}
@@ -809,36 +953,15 @@ func LoadRepositoryModelProfile(
 	if err != nil {
 		return ModelProfile{}, err
 	}
-	if err := schemaVersionOf(document, label); err != nil {
-		return ModelProfile{}, err
-	}
-	kind, ok := document["kind"].(string)
-	if !ok || kind != "model" {
-		return ModelProfile{}, fmt.Errorf("%s.kind must be model", label)
-	}
-	if _, exists := document["model"]; exists {
-		return ModelProfile{}, fmt.Errorf("%s must not set model; the repository ID is authoritative", label)
-	}
-	if err := checkKeys(document, label, []string{"schema_version", "kind"}, append([]string{"family"}, manifestSections...)); err != nil {
-		return ModelProfile{}, err
-	}
-	resolved := map[string]any{}
-	familyName := ""
-	if raw, exists := document["family"]; exists && raw != nil {
-		familyName, ok = raw.(string)
-		if !ok || familyName == "" {
-			return ModelProfile{}, fmt.Errorf("%s.family must be a family name or null", label)
-		}
-		resolved, err = resolveFamily(families, familyName, nil)
-		if err != nil {
-			return ModelProfile{}, fmt.Errorf("%s: %w", label, err)
+	for _, key := range []string{"model", "revision"} {
+		if _, exists := document[key]; exists {
+			return ModelProfile{}, fmt.Errorf("%s must not set %s; the repository is authoritative", label, key)
 		}
 	}
-	overlay := cloneValue(document).(map[string]any)
-	for _, key := range []string{"schema_version", "kind", "family"} {
-		delete(overlay, key)
+	_, resolved, familyName, err := resolveManifestDocument(families, manifestData, label, nil)
+	if err != nil {
+		return ModelProfile{}, err
 	}
-	resolved = deepMerge(resolved, overlay)
 	_, name, _ := strings.Cut(repositoryID, "/")
 	profile, err := decodeProfile(name, resolved, label)
 	if err != nil {
@@ -848,6 +971,70 @@ func LoadRepositoryModelProfile(
 	profile.ManifestCommit = manifestCommit
 	profile.Family = familyName
 	return profile, nil
+}
+
+// LoadCatalogModelProfile parses a manifest stored in the catalog
+// repository for a model whose weights live elsewhere. The manifest names
+// the upstream repository and, when the model runs remote code, pins its
+// commit.
+func LoadCatalogModelProfile(
+	familiesData, manifestData []byte,
+	name, catalogCommit, label string,
+) (ModelProfile, error) {
+	if !hfRepositoryName.MatchString(name) {
+		return ModelProfile{}, fmt.Errorf("catalog entry name %q is not a valid repository name", name)
+	}
+	if catalogCommit != "" && !hfCommit.MatchString(catalogCommit) {
+		return ModelProfile{}, fmt.Errorf("manifest commit must be a 40-character SHA; got %q", catalogCommit)
+	}
+	families, err := loadFamilies(familiesData)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	document, resolved, familyName, err := resolveManifestDocument(families, manifestData, label, []string{"model", "revision"})
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	root := section{document, label}
+	model, err := root.stringOr("model", "")
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	if !hfModelID.MatchString(model) {
+		return ModelProfile{}, fmt.Errorf("%s.model must name the upstream repository in owner/name form", label)
+	}
+	revision, err := root.stringOr("revision", "")
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	if revision != "" && !hfCommit.MatchString(revision) {
+		return ModelProfile{}, fmt.Errorf("%s.revision must be a 40-character commit SHA", label)
+	}
+	profile, err := decodeProfile(name, resolved, label)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	if profile.Serving.TrustRemoteCode && revision == "" {
+		return ModelProfile{}, fmt.Errorf(
+			"%s enables trust_remote_code for an external repository and must pin a revision", label,
+		)
+	}
+	profile.Model = model
+	profile.Revision = revision
+	profile.ManifestCommit = catalogCommit
+	profile.Family = familyName
+	return profile, nil
+}
+
+// ManifestNamesModel reports whether a manifest body carries a model field,
+// which distinguishes a catalog entry from a repository-rooted manifest.
+func ManifestNamesModel(manifestData []byte, label string) (bool, error) {
+	document, err := parseYAMLDocument(manifestData, label)
+	if err != nil {
+		return false, err
+	}
+	_, ok := document["model"]
+	return ok, nil
 }
 
 type DraftProfile struct {
