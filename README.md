@@ -242,10 +242,10 @@ The sections:
   assertion checked against the checkpoint; it is required only when the
   checkpoint metadata cannot decide, and `mtp.moe_backend` overrides the
   backend the quantization implies. NVFP4, MXFP4, and BF16 experts use the
-  B12X backend, MXFP8 experts use Triton, and block-FP8 experts need an
-  explicit backend. Declaring `humming` adds the topology's discovered NVRTC
-  library directory to the launch, which the Humming kernels load at runtime.
-  A DSpark draft always ships inside the target checkpoint.
+  B12X backend, MXFP8 experts use Humming, and block-FP8 experts need an
+  explicit backend. A Humming launch adds the topology's discovered NVRTC
+  library directory, which the Humming kernels load at runtime. A DSpark
+  draft always ships inside the target checkpoint.
 - `capacity`, `compilation`, and `environment` are the base launch layer.
   Capacity defaults are `max_model_len: auto`, eight sequences, and 4096
   batched tokens; `capacity.gpu_memory_utilization` replaces the topology's

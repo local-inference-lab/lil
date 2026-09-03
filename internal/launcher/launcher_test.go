@@ -695,7 +695,7 @@ func TestMTPBackendFollowsCheckpointQuantization(t *testing.T) {
 		backend      string
 	}{
 		{"W4A16_NVFP4", "nvfp4", "b12x"},
-		{"MXFP8", "mxfp8", "triton"},
+		{"MXFP8", "mxfp8", "humming"},
 		{"BF16", "bf16", "b12x"},
 	}
 	for _, test := range tests {
@@ -727,7 +727,7 @@ func TestMTPBackendDerivesFromRealConfigsAndMatchesManifestAssertions(t *testing
 	for name, want := range map[string][2]string{
 		glmProfile:           {"bf16", "b12x"},
 		glmSparkProfile:      {"nvfp4", "b12x"},
-		glmFlashProfile:      {"mxfp8", "triton"},
+		glmFlashProfile:      {"mxfp8", "humming"},
 		glmFlashSparkProfile: {"nvfp4", "b12x"},
 		qwenProfile:          {"nvfp4", "b12x"},
 		deepseekStandard:     {"mxfp4", "b12x"},
@@ -1356,10 +1356,6 @@ func TestDeepSeekOverridesFollowTheSpeculator(t *testing.T) {
 func TestHummingBackendNeedsTheDiscoveredNVRTCDirectory(t *testing.T) {
 	config := loadTestConfig(t)
 	profile := config.profiles[glmFlashProfile]
-	backend := "humming"
-	mtp := *profile.Speculators.MTP
-	mtp.MoEBackend = &backend
-	profile.Speculators.MTP = &mtp
 	spec, err := BuildLaunchSpec(profile, config.local, defaultOptions(4))
 	if err != nil {
 		t.Fatal(err)
@@ -1375,12 +1371,15 @@ func TestHummingBackendNeedsTheDiscoveredNVRTCDirectory(t *testing.T) {
 	if _, err := BuildLaunchSpec(profile, bare, defaultOptions(4)); err == nil || !strings.Contains(err.Error(), "nvrtc_library_dir") {
 		t.Fatalf("Humming without NVRTC directory: %v", err)
 	}
-	plain, err := BuildLaunchSpec(config.profiles[glmFlashProfile], config.local, defaultOptions(4))
+	plain, err := BuildLaunchSpec(config.profiles[glmFlashSparkProfile], config.local, defaultOptions(4))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, set := plain.RuntimeEnvironment["LD_LIBRARY_PATH"]; set {
-		t.Fatalf("Triton launch must not set LD_LIBRARY_PATH: %+v", plain.RuntimeEnvironment)
+		t.Fatalf("B12X launch must not set LD_LIBRARY_PATH: %+v", plain.RuntimeEnvironment)
+	}
+	if !strings.HasPrefix(spec.RuntimeEnvironment["LD_LIBRARY_PATH"], config.local.NVRTCLibraryDir()) {
+		t.Fatalf("MXFP8 experts select Humming and need NVRTC: %+v", spec.RuntimeEnvironment)
 	}
 	options := defaultOptions(4)
 	options.EnvironmentOverrides = []EnvironmentOverride{{"LD_LIBRARY_PATH", "/x"}}

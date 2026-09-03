@@ -38,6 +38,7 @@ cache_mounts:
     target: /root/.cache/huggingface
 cuda_home: /usr/local/cuda
 cute_dsl_arch: sm_121a
+nvrtc_library_dir: /home/luke/projects/vllm/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
 nccl_debug: INFO
 nccl_ib_gid_index: 3
 nccl_ib_merge_nics: true

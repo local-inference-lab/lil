@@ -49,7 +49,7 @@ is qualified when:
    local launch and inside the launch image for a Spark launch.
 4. Multimodal flags appear only for multimodal architectures.
 5. MTP expert selection resolves NVFP4, MXFP4, and BF16 to B12X and MXFP8 to
-   Triton, or to the backend the entry declares.
+   Humming, or to the backend the entry declares.
 6. CUDA graph sizes cover all resolved MTP verification batches and the mixed
    batch ladder.
 7. A Hub-backed run updates every required repository in each selected rank's
@@ -81,8 +81,9 @@ Two settings deliberately differ from a reference and are recorded here:
   compilation, which its scripts do not, and uses the TP2 script's BF16 KV
   cache at every TP where the TP1 script uses fp8.
 
-The MXFP8 MTP expert backend stays on Triton until Humming has been
-benchmarked against it; the GLM-5.3 Flash script selects Humming.
+MXFP8 MTP experts run on Humming, as the GLM-5.3 Flash script selects. The
+Triton MXFP8 expert kernel refuses SM120 at worker start, so it is not an
+alternative on this hardware.
 
 ## DeepSeek V4 Flash
 

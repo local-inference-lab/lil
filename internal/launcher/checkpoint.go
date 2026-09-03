@@ -28,7 +28,7 @@ func MTPMoEBackendFromQuantization(quantization, evidence string) (MTPMoEBackend
 	backend, ok := map[string]string{
 		"nvfp4": "b12x",
 		"mxfp4": "b12x",
-		"mxfp8": "triton",
+		"mxfp8": "humming",
 		"bf16":  "b12x",
 	}[quantization]
 	if !ok {
