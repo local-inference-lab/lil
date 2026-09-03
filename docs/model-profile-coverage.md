@@ -85,6 +85,20 @@ MXFP8 MTP experts run on Humming, as the GLM-5.3 Flash script selects. The
 Triton MXFP8 expert kernel refuses SM120 at worker start, so it is not an
 alternative on this hardware.
 
+`GLM-5.3-NVFP4` is served through `lil` at the `fit` default TP 8 on the
+twelve-GPU RTX PRO 6000 topology with MTP depth 3 and FULL_AND_PIECEWISE
+graphs (health check, a fixed-reply completion, and a 512-token generation).
+Speculative decoding on the DSA architecture requires a vLLM tree whose
+B12X sparse-MLA metadata builder keeps per-token cache lengths in a
+persistent buffer; `local-inference-lab/vllm` branch `dev/jovian-judgement`
+carries this from commit `83cb22a0e3`. Earlier trees fault with an illegal
+memory access in the first speculative warmup step whenever FULL graphs are
+captured, while eager and piecewise-only runs pass. `GLM-5.3-NVFP4-Spark`
+shares that path; it faulted the same way on the earlier tree and has not
+been served since the fix. The reference script's explicit capture ladder
+(every size from 1 to 16, then steps of 4 to 64) is not a requirement: the
+launcher's computed ladder serves the same batches.
+
 ## DeepSeek V4 Flash
 
 The `deepseek-v4` family reproduces the SM120 PCIe policy of the
@@ -98,8 +112,14 @@ MegaMoE and multi-stream GEMM environment. Three catalog entries use it.
   is the default speculator at the qualified fixed depth 5, with eight
   sequences and a 48-row graph envelope; `--speculator none` switches to the
   32-sequence target-only profile. Standard MTP is not offered on this
-  checkpoint. Status: implemented, preflight-qualified against the installed
-  parser, not yet served through `lil`.
+  checkpoint. Status: implemented, served through `lil` at the `fit` default
+  TP 2 on the twelve-GPU RTX PRO 6000 topology (health check, a short
+  thinking completion, and a 404-token DSpark generation). Serving DSpark
+  requires a vLLM tree whose sparse-MLA metadata builder splits DSpark
+  batches at 1 + K rows, the boundary the sparse SWA builder uses;
+  `local-inference-lab/vllm` branch `dev/jovian-judgement` carries this from
+  commit `341f198b27`. Earlier trees fail kernel warmup with an assertion
+  on the C128A prefill indices in the B12X attention path.
 - `DeepSeek-V4-Flash` is the standard checkpoint with its MTP head at depth
   2, the depth the lab's decode sweeps found best, at 64 sequences and 0.91
   utilization. Status: implemented, preflight-qualified.
@@ -109,6 +129,12 @@ MegaMoE and multi-stream GEMM environment. Three catalog entries use it.
   are outside the launcher's contract. Status: research-only.
 
 The entries keep `max_model_len: auto` so the runtime profile sizes the KV
-cache; the references fix 131072 or 1048576 tokens. The r21 page also serves
-FP8 dense projections through DeepGEMM by omitting the B12X linear backend;
-the entries follow the working tree's script and keep B12X.
+cache; the references fix 131072 or 1048576 tokens. At TP 2 the 0731 entry
+resolves to 1,048,576 tokens with 8.7 GiB of KV cache per GPU at 0.975
+utilization, enough for 1.25 full-length sequences. The shell launcher's own
+profile (16 sequences, 131072 tokens, 8192 batched tokens, 128-row graph
+capture) assumes its TP 4 default; at TP 2 it leaves 4.0 GiB of KV cache
+against the 6.7 GiB one 131072-token sequence needs and the engine refuses
+to start. The r21 page also serves FP8 dense projections through DeepGEMM by
+omitting the B12X linear backend; the entries follow the working tree's
+script and keep B12X.
