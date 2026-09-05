@@ -140,6 +140,17 @@ func TestConfigurationErrorsReturnUsageStatus(t *testing.T) {
 	}
 }
 
+func TestImportRequiresRepositoryAndSourceAndSupportsHelp(t *testing.T) {
+	for _, args := range [][]string{{"import"}, {"import", "lab/Model"}, {"import", "lab/Model", "source", "extra"}} {
+		if status, err := execute(context.Background(), args); status != 2 || err == nil {
+			t.Fatalf("%v: status=%d error=%v", args, status, err)
+		}
+	}
+	if status, err := execute(context.Background(), []string{"import", "--help"}); status != 0 || err != nil {
+		t.Fatalf("import help: status=%d error=%v", status, err)
+	}
+}
+
 func TestRenderJSONUsesSparkTopologyByKind(t *testing.T) {
 	configureTestTopologies(t)
 	fs := newFlagSet("render")

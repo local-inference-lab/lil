@@ -148,7 +148,7 @@ cannot be overridden.
 
 ## Latest-model and cache contract
 
-Every command resolves the catalog repository's head commit through the
+Catalog and launch commands resolve the catalog repository's head commit through the
 Hugging Face API on each invocation and reads the requested entry there. It
 then resolves the entry's weight repository, at the pinned revision when the
 entry has one and at head otherwise, and reads `config.json` and the size of
@@ -175,6 +175,42 @@ the configured Docker image's `hf` executable with that cache mounted. If no
 can still download during startup; that fallback may not expose useful
 progress. A present `hf` command returning an authentication, network, or
 filesystem error fails the run.
+
+### Import local model files
+
+`lil import` registers an existing model directory under its Hugging Face
+repository ID without downloading file contents or duplicating weight storage:
+
+```bash
+lil import local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
+  /data/models/qwen3.8-flash-next-mixed/qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1 \
+  --dry-run
+```
+
+Remove `--dry-run` to write the cache entries. Pass the directory containing
+the repository files, such as `config.json` and weight shards. This command
+accepts a repository ID directly and does not require a catalog entry or
+topology. `--revision SHA` selects a 40-character commit; otherwise it resolves
+`main` and updates the cache's `refs/main` after importing.
+
+The importer reads Hub metadata and verifies every matching local file's size
+and content hash before writing cache entries: SHA-256 for LFS weights and
+Git blob SHA-1 for regular files. It hardlinks files into `blobs/` and creates
+relative symlinks in `snapshots/<commit>/`. Existing cache files must match;
+conflicts fail the import. Unrelated local files and incomplete downloads are
+left alone. Missing repository files are listed explicitly; a later `hf
+download` or `lil run` can fetch them while reusing the imported files.
+
+The source and cache must share a filesystem. Hardlinks keep the data alive
+if either path is deleted, but editing a linked file in place changes both
+paths: treat imported files as immutable. There is no copy fallback.
+
+`--cache-dir` selects the Hub cache directory. Its default follows
+`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, then `HF_HOME/hub`, with
+`XDG_CACHE_HOME/huggingface/hub` or `~/.cache/huggingface/hub` as the fallback.
+`LIL_CACHE_DIR` controls catalog metadata and does not change the Hub cache.
+Verification progress and counts go to stderr; stdout contains the snapshot
+path. A dry run performs the same content checks without writing cache entries.
 
 ## The catalog
 

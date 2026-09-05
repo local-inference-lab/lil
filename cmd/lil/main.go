@@ -805,6 +805,7 @@ Build deterministic local or Spark/RDMA vLLM launches.
 Commands:
   list      List the catalog's launchable models and local topologies.
   discover  Discover and save a local or Spark/RDMA topology.
+  import    Import local model files into the Hugging Face cache using hardlinks.
   render    Render the resolved environment and command without executing it.
   check     Run read-only launch preflight checks.
   run       Run preflight checks, then execute the launch.
@@ -841,6 +842,8 @@ func execute(ctx context.Context, args []string) (int, error) {
 		return commandErrorStatus(listCommand(ctx, args[1:]))
 	case "discover":
 		return commandErrorStatus(discoverCommand(ctx, args[1:]))
+	case "import":
+		return commandErrorStatus(importCommand(ctx, args[1:]))
 	case "render":
 		return commandErrorStatus(renderCommand(ctx, args[1:]))
 	case "check":

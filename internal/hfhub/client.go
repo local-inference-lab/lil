@@ -43,6 +43,11 @@ var (
 type Sibling struct {
 	Filename string `json:"rfilename"`
 	Size     int64  `json:"size,omitempty"`
+	BlobID   string `json:"blobId,omitempty"`
+	LFS      *struct {
+		SHA256 string `json:"sha256"`
+		Size   int64  `json:"size"`
+	} `json:"lfs,omitempty"`
 }
 
 // Repository is a listing of one repository at one commit, with file sizes.
