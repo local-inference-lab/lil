@@ -12,15 +12,15 @@ serving:
     processor_cache_gb: 0
     limit_per_prompt:
       image: 1
-kernels:
+cache:
   kv_cache_dtype: bfloat16
-  quantization: modelopt_mixed
   block_size: 16
-  gdn_decode: b12x
   mamba_cache_mode: align
+precision:
+  quantization: modelopt_mixed
+kernels:
+  gdn_decode: b12x
   flashinfer_autotune: false
-  loader_extra_config:
-    instanttensor_copy: false
 speculators:
   default: mtp
   mtp:
@@ -49,9 +49,6 @@ overrides:
         fuse_act_quant: true
     environment:
       VLLM_PLE_CPU_OFFLOAD: "1"
-      INSTANTTENSOR_BUFFER_SIZE: "1342177280"
-      INSTANTTENSOR_CONCURRENCY: "1"
-      INSTANTTENSOR_IO_DEPTH: "3"
   - when:
       kind: spark_rdma
     capacity:

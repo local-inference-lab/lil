@@ -380,3 +380,41 @@ func TestResolveFollowsHeadPinsRevisionsAndCachesFiles(t *testing.T) {
 		t.Fatal("resolution silently succeeded while the Hub was unavailable")
 	}
 }
+
+func TestAuthenticationTokenLocations(t *testing.T) {
+	for _, location := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_TOKEN_PATH", "HF_HOME", "XDG_CACHE_HOME"} {
+		t.Run(location, func(t *testing.T) {
+			for _, name := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_TOKEN_PATH", "HF_HOME", "XDG_CACHE_HOME"} {
+				t.Setenv(name, "")
+			}
+			root := t.TempDir()
+			switch location {
+			case "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN":
+				t.Setenv(location, " test-token \n")
+			default:
+				path := filepath.Join(root, "token")
+				if location == "XDG_CACHE_HOME" {
+					path = filepath.Join(root, "huggingface", "token")
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("test-token\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if location == "HF_TOKEN_PATH" {
+					t.Setenv(location, path)
+				} else {
+					t.Setenv(location, root)
+				}
+			}
+			if got := huggingFaceToken(); got != "test-token" {
+				t.Fatalf("token = %q", got)
+			}
+			t.Setenv("HF_TOKEN", "override")
+			if got := huggingFaceToken(); got != "override" {
+				t.Fatalf("HF_TOKEN precedence: %q", got)
+			}
+		})
+	}
+}

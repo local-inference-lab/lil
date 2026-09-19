@@ -116,6 +116,7 @@ type launchSpecJSON struct {
 	Topology           string               `json:"topology"`
 	TopologyKind       string               `json:"topology_kind"`
 	TensorParallelSize int                  `json:"tensor_parallel_size"`
+	DataParallelSize   int                  `json:"data_parallel_size"`
 	DeviceIDs          []int                `json:"device_ids"`
 	Host               string               `json:"host"`
 	Port               int                  `json:"port"`
@@ -157,7 +158,7 @@ func JSONRender(spec LaunchSpec) ([]byte, error) {
 		ModelSource:    spec.ModelSource,
 		CheckpointPath: spec.CheckpointPath, ServedModelName: spec.ServedModelName,
 		Topology: spec.Topology.Name(), TopologyKind: spec.Topology.Kind,
-		TensorParallelSize: spec.TPSize, DeviceIDs: deviceIDs,
+		TensorParallelSize: spec.TPSize, DataParallelSize: spec.DPSize, DeviceIDs: deviceIDs,
 		Host: spec.Host, Port: spec.Port, Detach: spec.Detach, SyncCode: spec.SyncCode,
 		SyncModel: spec.SyncModel, Downloads: spec.Downloads,
 		UnsetEnvironment: unset, RuntimeEnvironment: spec.RuntimeEnvironment,

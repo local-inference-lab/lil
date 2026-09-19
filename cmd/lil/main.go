@@ -32,6 +32,7 @@ type launchFlags struct {
 	config                    string
 	modelsConfig              string
 	tp                        int
+	dp                        int
 	devices                   string
 	modelPath                 string
 	servedModelName           string
@@ -71,6 +72,7 @@ func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bo
 	fs.StringVar(&values.config, "config", "", "discovered topology name or YAML path")
 	fs.StringVar(&values.modelsConfig, "models-config", "", "local catalog directory of <model>/lil.yaml entries with config.json and safetensors index")
 	fs.IntVar(&values.tp, "tp", 0, "tensor parallel size")
+	fs.IntVar(&values.dp, "dp", 1, "local data parallel replicas (GPUs = TP * DP)")
 	fs.StringVar(&values.devices, "devices", "", "comma-separated local physical GPU IDs")
 	fs.StringVar(&values.modelPath, "model-path", "", "local checkpoint path")
 	fs.StringVar(&values.servedModelName, "served-model-name", "", "served API model name")
@@ -78,10 +80,10 @@ func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bo
 	fs.IntVar(&values.port, "port", 0, "API port")
 	fs.Float64Var(&values.gpuMemoryUtilization, "gpu-memory-utilization", 0, "vLLM GPU memory utilization")
 	fs.StringVar(&values.kvCacheMemoryBytes, "kv-cache-memory-bytes", "", "explicit KV allocation or auto")
-	fs.StringVar(&values.kvCacheDType, "kv-cache-dtype", "", "KV cache dtype (default: the manifest's kernels.kv_cache_dtype)")
+	fs.StringVar(&values.kvCacheDType, "kv-cache-dtype", "", "KV cache dtype (default: the manifest's cache.kv_cache_dtype)")
 	fs.StringVar(&values.maxModelLen, "max-model-len", "", "maximum model length")
-	fs.IntVar(&values.maxNumSeqs, "max-num-seqs", 0, "maximum concurrent sequences")
-	fs.IntVar(&values.maxNumBatchedTokens, "max-num-batched-tokens", 0, "maximum batched tokens")
+	fs.IntVar(&values.maxNumSeqs, "max-num-seqs", 0, "maximum concurrent sequences per replica")
+	fs.IntVar(&values.maxNumBatchedTokens, "max-num-batched-tokens", 0, "maximum batched tokens per replica")
 	fs.IntVar(&values.dcp, "dcp", 1, "decode context parallel size")
 	fs.StringVar(&values.dcpCommBackend, "dcp-comm-backend", "a2a", "DCP communication backend")
 	fs.StringVar(&values.speculator, "speculator", "", "mtp, dflash, or none")
@@ -89,7 +91,7 @@ func configureLaunchFlags(fs *pflag.FlagSet, values *launchFlags, includeSync bo
 	fs.BoolVar(&values.adaptiveSpeculativeTokens, "adaptive-speculative-tokens", false, "enable adaptive MTP depth")
 	fs.IntVar(&values.adaptiveWindow, "adaptive-window", 32, "adaptive MTP window")
 	fs.IntVar(&values.adaptiveInitial, "adaptive-initial", 0, "adaptive MTP initial depth")
-	fs.BoolVar(&values.adaptiveVerification, "adaptive-verification", false, "enable DSpark adaptive verification")
+	fs.BoolVar(&values.adaptiveVerification, "adaptive-verification", false, "override DSpark adaptive verification (default: profile setting)")
 	fs.BoolVar(&values.pleCPUOffload, "ple-cpu-offload", false, "enable mapped-host PLE")
 	fs.BoolVar(&values.noPLECPUOffload, "no-ple-cpu-offload", false, "disable mapped-host PLE")
 	fs.StringVar(&values.b12xPolicyMode, "b12x-policy-mode", "auto", "B12X policy mode")
@@ -145,6 +147,7 @@ func parseEnvironment(values []string) ([]launcher.EnvironmentOverride, error) {
 func (values launchFlags) options(fs *pflag.FlagSet, extraArgs []string) (launcher.LaunchOptions, error) {
 	options := launcher.LaunchOptions{
 		TPSize:               pointerIfChanged(fs, "tp", values.tp),
+		DPSize:               pointerIfChanged(fs, "dp", values.dp),
 		ModelPath:            pointerIfChanged(fs, "model-path", values.modelPath),
 		ServedModelName:      pointerIfChanged(fs, "served-model-name", values.servedModelName),
 		Host:                 pointerIfChanged(fs, "host", values.host),
@@ -161,7 +164,7 @@ func (values launchFlags) options(fs *pflag.FlagSet, extraArgs []string) (launch
 		AdaptiveSpeculativeTokens: values.adaptiveSpeculativeTokens,
 		AdaptiveWindow:            values.adaptiveWindow,
 		AdaptiveInitial:           pointerIfChanged(fs, "adaptive-initial", values.adaptiveInitial),
-		AdaptiveVerification:      values.adaptiveVerification,
+		AdaptiveVerification:      pointerIfChanged(fs, "adaptive-verification", values.adaptiveVerification),
 		B12XPolicyMode:            values.b12xPolicyMode, ExtraVLLMArgs: extraArgs,
 		Detach: values.detach, SyncCode: values.syncCode, SyncModel: values.syncModel,
 	}
@@ -226,12 +229,11 @@ func hubFacts(ctx context.Context, client *hfhub.Client, repository hfhub.Reposi
 }
 
 func hubModelEntry(ctx context.Context, client *hfhub.Client, families []byte, catalogRepository hfhub.Repository, name string) (launcher.ModelProfile, error) {
-	label := catalogRepository.ID + "/" + name + "/lil.yaml"
-	manifest, _, err := client.FetchFile(ctx, catalogRepository, name+"/lil.yaml", hfhub.ManifestLimit)
+	manifest, label, commit, err := catalogManifest(ctx, client, catalogRepository, name)
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
-	profile, err := launcher.LoadModelEntry(families, manifest, name, catalogRepository.Revision, label, modelRepositoryOwner)
+	profile, err := launcher.LoadModelEntry(families, manifest, name, commit, label, modelRepositoryOwner)
 	if err != nil {
 		return launcher.ModelProfile{}, err
 	}
@@ -247,17 +249,15 @@ func hubModelEntry(ctx context.Context, client *hfhub.Client, families []byte, c
 }
 
 func hubDraftEntry(ctx context.Context, client *hfhub.Client, catalogRepository hfhub.Repository, name string) (launcher.DraftProfile, error) {
-	label := catalogRepository.ID + "/" + name + "/lil.yaml"
-	manifest, _, err := client.FetchFile(ctx, catalogRepository, name+"/lil.yaml", hfhub.ManifestLimit)
+	manifest, label, commit, err := catalogManifest(ctx, client, catalogRepository, name)
 	if err != nil {
 		return launcher.DraftProfile{}, err
 	}
-	return launcher.LoadDraftEntry(manifest, name, catalogRepository.Revision, label)
+	return launcher.LoadDraftEntry(manifest, name, commit, label)
 }
 
 func hubEntryKind(ctx context.Context, client *hfhub.Client, catalogRepository hfhub.Repository, name string) (string, error) {
-	label := catalogRepository.ID + "/" + name + "/lil.yaml"
-	manifest, _, err := client.FetchFile(ctx, catalogRepository, name+"/lil.yaml", hfhub.ManifestLimit)
+	manifest, label, _, err := catalogManifest(ctx, client, catalogRepository, name)
 	if err != nil {
 		return "", err
 	}
@@ -805,6 +805,7 @@ Build deterministic local or Spark/RDMA vLLM launches.
 Commands:
   list      List the catalog's launchable models and local topologies.
   discover  Discover and save a local or Spark/RDMA topology.
+  edit      Edit a model manifest locally or in the Hugging Face catalog.
   import    Import local model files into the Hugging Face cache using hardlinks.
   render    Render the resolved environment and command without executing it.
   check     Run read-only launch preflight checks.
@@ -842,6 +843,8 @@ func execute(ctx context.Context, args []string) (int, error) {
 		return commandErrorStatus(listCommand(ctx, args[1:]))
 	case "discover":
 		return commandErrorStatus(discoverCommand(ctx, args[1:]))
+	case "edit":
+		return commandErrorStatus(editCommand(ctx, args[1:]))
 	case "import":
 		return commandErrorStatus(importCommand(ctx, args[1:]))
 	case "render":

@@ -24,7 +24,6 @@ var derivedEnvironment = stringSet(
 )
 
 var commonHostEnvironment = map[string]string{
-	"INSTANTTENSOR_BACKEND":        "BUFFERED",
 	"OMP_NUM_THREADS":              "16",
 	"PYTORCH_CUDA_ALLOC_CONF":      "expandable_segments:True",
 	"SAFETENSORS_FAST_GPU":         "1",
@@ -62,9 +61,6 @@ func DefaultLocalEnvironment() map[string]string {
 func DefaultSparkEnvironment() map[string]string {
 	environment := copyStringMap(commonHostEnvironment)
 	for name, value := range map[string]string{
-		"INSTANTTENSOR_BUFFER_SIZE":    "1342177280",
-		"INSTANTTENSOR_CONCURRENCY":    "1",
-		"INSTANTTENSOR_IO_DEPTH":       "3",
 		"NCCL_IB_DISABLE":              "0",
 		"NCCL_IB_SUBNET_AWARE_ROUTING": "1",
 		"NCCL_IGNORE_CPU_AFFINITY":     "1",
@@ -100,7 +96,7 @@ func searchPath(variable string, paths []string, inherit bool) string {
 // tuning, launcher-derived values, resolved manifest environment, the PLE
 // command-line switch, and explicit --env overrides. needsNVRTC adds the
 // discovered NVRTC library directory for launches that run Humming kernels.
-func runtimeEnvironment(topology Topology, settings LaunchSettings, options LaunchOptions, needsNVRTC bool) (map[string]string, []string, error) {
+func runtimeEnvironment(topology Topology, settings LaunchSettings, options LaunchOptions, needsNVRTC bool, loadFormat string) (map[string]string, []string, error) {
 	environment := copyStringMap(topology.Environment())
 	runtimeRoots := []string{topology.RepoRoot(), topology.B12XRoot()}
 	if topology.Spark != nil {
@@ -120,6 +116,12 @@ func runtimeEnvironment(topology Topology, settings LaunchSettings, options Laun
 	environment["TRITON_PTXAS_PATH"] = filepath.Join(topology.CUDAHome(), "bin", "ptxas")
 	environment["CUTE_DSL_ARCH"] = topology.CuteDSLArch()
 	environment["B12X_POLICY_MODE"] = options.B12XPolicyMode
+	if loadFormat == "b12x" {
+		plugins := strings.Split(environment["VLLM_PLUGINS"], ",")
+		if !contains(plugins, "b12x_loader") {
+			environment["VLLM_PLUGINS"] = strings.Trim(environment["VLLM_PLUGINS"]+",b12x_loader", ",")
+		}
+	}
 	var unset []string
 	if topology.Local != nil {
 		unset = []string{"CUDA_VISIBLE_DEVICES", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"}

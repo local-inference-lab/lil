@@ -93,7 +93,9 @@ weights or executing it:
 lil render GLM-5.3-NVFP4 --config local --tp 8
 ```
 
-Run read-only preflight validation:
+Run preflight validation. Local checks construct the vLLM engine configuration
+with the configured interpreter to validate model, scheduler, and parallelism
+settings before any workers start:
 
 ```bash
 lil check GLM-5.3-NVFP4 --config local --tp 8
@@ -104,6 +106,28 @@ Update the standard Hugging Face cache with visible progress and launch:
 ```bash
 lil run GLM-5.3-NVFP4 --config local --tp 8
 ```
+
+Local data parallel serving is implemented through vLLM's internal load
+balancer, with one API endpoint. `--dp` always defaults to `1`; set it explicitly
+to launch multiple replicas:
+
+```bash
+lil run Qwen3.8-27B-NVFP4-QAD --config local --tp 2 --dp 4
+```
+
+This allocates eight GPUs from a discovered device pool. `--devices` may specify
+the full ordered list; each consecutive group of `TP` devices belongs to one
+replica. TP selection and memory estimates remain per replica, and `TP * DP`
+must fit the topology. `--max-num-seqs` and `--max-num-batched-tokens` also apply
+per replica. `lil render --format json` reports both parallel sizes and all
+selected devices. Data parallel sizes greater than one are unsupported on
+Spark/RDMA topologies.
+
+For DP greater than one, the inherited `prefill_compute_share` and
+`prefill_compute_half_life` defaults are omitted because vLLM does not support
+compute sharing across DP ranks. Explicit family or manifest values are
+rejected; set both fields to `null` or use DP=1. Other scheduler settings retain
+their configured values.
 
 For Spark/RDMA, `lil run` updates the cache on every selected rank, repeats the
 per-node host probes so that a conflict that appeared during the download is
@@ -149,9 +173,10 @@ cannot be overridden.
 ## Latest-model and cache contract
 
 Catalog and launch commands resolve the catalog repository's head commit through the
-Hugging Face API on each invocation and reads the requested entry there. It
-then resolves the entry's weight repository, at the pinned revision when the
-entry has one and at head otherwise, and reads `config.json` and the size of
+Hugging Face API on each invocation and read each requested manifest from its
+local override when present, or from that commit otherwise. They resolve the
+entry's weight repository at its pinned revision, or at head when unpinned,
+and read `config.json` and the size of
 every safetensors shard at that commit. Bytes already cached for an immutable
 commit are reused. Network resolution errors fail the command rather than
 silently using stale model policy.
@@ -212,6 +237,38 @@ paths: treat imported files as immutable. There is no copy fallback.
 Verification progress and counts go to stderr; stdout contains the snapshot
 path. A dry run performs the same content checks without writing cache entries.
 
+## Edit model manifests
+
+```bash
+EDITOR=vim lil edit GLM-5.3-NVFP4
+EDITOR='code --wait' lil edit GLM-5.3-NVFP4 --repository
+```
+
+`lil edit NAME` opens the existing local override, or copies
+`NAME/lil.yaml` from `local-inference-lab/lil-catalog` when no override exists.
+Saving a change writes `~/.config/lil/models/NAME/lil.yaml` (under
+`$XDG_CONFIG_HOME` when set). This complete manifest shadows the upstream
+entry for Hub-backed list, render, check, run, and cluster commands. Family
+defaults still apply. An explicit `--models-config` directory takes precedence
+and does not use these overrides. Remove the local file to use upstream again.
+Editing an existing override requires no network; Hub-backed launches still
+resolve the catalog and checkpoint metadata online.
+
+`--repository` always opens the upstream manifest and uploads changed contents
+to the catalog's `main` branch on successful editor exit. It uses `HF_TOKEN`,
+`HUGGING_FACE_HUB_TOKEN`, or the token saved by `hf auth login`, including
+`HF_TOKEN_PATH`, `HF_HOME`, and `XDG_CACHE_HOME` token locations. The token must
+have write access to `local-inference-lab/lil-catalog`. Uploads use a parent
+commit precondition to reject concurrent repository changes. Local overrides
+remain in place and still shadow an uploaded manifest; the command reports
+when one exists.
+
+`EDITOR` is required and may contain quoted arguments. GUI editors must use
+their wait option. Manifests are validated before saving or uploading; unchanged
+files produce no write. Editor, validation, and upload failures retain the
+working YAML file and report its path for recovery. Draft catalog entries can
+also be edited.
+
 ## The catalog
 
 Every launchable model is one entry in `local-inference-lab/lil-catalog`: a
@@ -249,6 +306,39 @@ environment:
   CUDA_DEVICE_MAX_CONNECTIONS: "32"
 ```
 
+Precision, cache policy, backend selection, and loading are separate mappings:
+
+```yaml
+precision:
+  dtype: bfloat16
+  quantization: modelopt_mixed
+cache:
+  kv_cache_dtype: fp8
+  indexer_kv_dtype: auto
+  block_size: 16
+  mamba_cache_mode: align
+  recurrent_checkpoint_policy: request_boundaries
+  prefix_cache_retention_interval: 4096
+kernels:
+  attention: B12X
+  linear: b12x
+  moe: b12x
+  gdn_prefill: b12x
+  gdn_decode: b12x
+  kda_prefill: auto
+  mamba: triton
+  flashinfer_autotune: true
+loading:
+  load_format: b12x
+  loader_extra_config: {}
+```
+
+Set only the options relevant to the model and hardware. String selectors must
+be non-empty; vLLM validates backend and dtype support at runtime. Unknown
+section keys are rejected. Each mapping inherits family values; explicit
+manifest values win, and null clears inheritance for that value. Defaulted
+fields then use launcher defaults, while optional fields emit no argument.
+
 The sections:
 
 - `model` names the weight repository in owner/name form; it may belong to
@@ -264,15 +354,37 @@ The sections:
 - `serving` holds the API-facing policy: served name, remote code, tokenizer
   mode, parsers, tool choice, generation config, default chat-template
   arguments, scheduler switches including the prefill schedule interval,
-  prefix-cache retention, usage and request-ID reporting, and multimodal
+  usage and request-ID reporting, and multimodal
   limits. `auto_tool_choice` defaults to true when a
   tool parser is set. Prefix caching and chunked prefill default to on. A
   manifest without parsers or a tool parser emits none of those flags.
-- `kernels` holds dtype, KV cache dtype, quantization, attention, linear, MoE,
-  and GDN decode backends, block size, Mamba cache mode, FlashInfer autotuning,
-  and the weight loader. Defaults are bfloat16 weights, an fp8 KV cache, the
-  B12X linear and MoE backends, and the instanttensor loader.
-  `--kv-cache-dtype` overrides the KV cache dtype for one launch.
+- `precision` holds `dtype` (default: `bfloat16`) and optional `quantization`.
+  These select compute precision and the checkpoint quantization implementation.
+- `cache` holds `kv_cache_dtype` (default: `fp8`), `indexer_kv_dtype`,
+  `block_size`, `mamba_cache_mode`, `recurrent_checkpoint_policy`, and
+  `prefix_cache_retention_interval`. `--kv-cache-dtype` overrides the manifest
+  for one launch. `indexer_kv_dtype` accepts `auto`, `bf16`, `fp8`, `mxfp4`, or
+  `nvfp4` in the configured vLLM fork and is passed in `--attention-config`.
+  `recurrent_checkpoint_policy` accepts `auto`, `aligned`, or
+  `request_boundaries`. Request boundaries retain the verified leading
+  instruction prefix, completed prompt, and committed response endpoint;
+  aligned retention uses block boundaries. `auto` selects request boundaries
+  when supported and aligned retention otherwise. The retention interval is
+  a non-negative integer; `0` retains only semantic checkpoints. Omission
+  leaves the vLLM default in effect. `block_size` must be a positive integer.
+- `kernels` selects `attention`, `linear`, `moe`, `gdn_prefill`, `gdn_decode`,
+  `kda_prefill`, and `mamba` backends and controls `flashinfer_autotune`.
+  Linear and MoE backends default to `b12x`. In the configured vLLM fork,
+  `gdn_prefill` accepts `flashinfer`, `triton`, `cutedsl`, or `b12x`;
+  `gdn_decode` accepts `b12x`, `cuda`, or `triton`; `kda_prefill` accepts
+  `auto`, `triton`, `flashkda`, or `b12x`; and `mamba` accepts `triton`,
+  `flashinfer`, or `cpu`. B12X GDN prefill and decode must be selected
+  consistently. Optional backend selectors emit no option when omitted or null.
+- `loading` holds `load_format` and the `loader_extra_config` mapping. Local
+  PCIe launches default to `instanttensor`; Spark (SM121) launches default to
+  `b12x` with the `b12x_loader` plugin enabled. `loading.load_format` overrides
+  that platform default. Extra configuration is passed as JSON through
+  `--model-loader-extra-config`.
 - `speculators` names a `default` of `mtp`, `dflash`, `dspark`, or `none`
   (the default) and a section per method. `mtp.moe_quantization` is an
   assertion checked against the checkpoint; it is required only when the
@@ -281,7 +393,9 @@ The sections:
   B12X backend, MXFP8 experts use Humming, and block-FP8 experts need an
   explicit backend. A Humming launch adds the topology's discovered NVRTC
   library directory, which the Humming kernels load at runtime. A DSpark
-  draft always ships inside the target checkpoint.
+  draft always ships inside the target checkpoint. `dspark.adaptive_verification`
+  sets its default verification policy; `--adaptive-verification=true` or
+  `--adaptive-verification=false` overrides it for one launch.
 - `capacity`, `compilation`, and `environment` are the base launch layer.
   Capacity defaults are `max_model_len: auto`, eight sequences, and 4096
   batched tokens; `capacity.gpu_memory_utilization` replaces the topology's
@@ -323,7 +437,7 @@ invalid types fail closed.
 | Concern | Owner |
 | --- | --- |
 | Architectures, attention heads, stored size, MTP expert quantization | weight repository `config.json` and shard sizes at the resolved commit |
-| Weight repository, pinned revision, serving identity, parsers, kernel selection, speculation, capacity and compilation layers, conditional overrides | catalog entry plus its family |
+| Weight repository, pinned revision, serving identity, parsers, precision, cache policy, kernel selection, loading, speculation, capacity and compilation layers, conditional overrides | catalog entry plus its family |
 | GPU inventory, CUDA path, memory-utilization ceiling, default TP policy, host tuning environment, API bind defaults, local pools, SSH/RDMA layout, image, and cache mounts | discovered topology YAML |
 | TP, local checkpoint, bind overrides, KV dtype, scheduler limits, capacity, profiling, speculation overrides, and one-off environment overrides | typed `lil` CLI |
 | Derived environment, default TP fit, graph capture sizes, native commands | Go launcher |

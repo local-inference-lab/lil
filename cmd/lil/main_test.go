@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -48,7 +49,8 @@ func TestListShowsFactsAndPerTopologyDefaults(t *testing.T) {
 	}
 	output := ansi.Strip(renderList(loaded.models))
 	for _, want := range []string{
-		"Models  8\n\n",
+		"Models  9\n\n",
+		"DeepSeek-V4.1-Flash",
 		"DeepSeek-V4-Flash-0731",
 		"148.6 GiB stored  ·  family deepseek-v4  ·  speculator mtp",
 		"155.4 GiB stored  ·  family deepseek-v4  ·  speculator dspark",
@@ -119,6 +121,65 @@ func TestManagedForwardedArgumentFailsClosed(t *testing.T) {
 	_, err := buildSpec(context.Background(), fs, values)
 	if err == nil || !strings.Contains(err.Error(), "launcher-managed") {
 		t.Fatalf("managed argument error: %v", err)
+	}
+}
+
+func TestDeepSeekVisionDefaultsAndExplicitVerificationOverrides(t *testing.T) {
+	configureTestTopologies(t)
+	for _, test := range []struct {
+		name     string
+		args     []string
+		adaptive bool
+	}{
+		{"default", nil, true},
+		{"enabled", []string{"--adaptive-verification=true"}, true},
+		{"disabled", []string{"--adaptive-verification=false"}, false},
+		{"target-only", []string{"--speculator=none"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := newFlagSet("render")
+			var values launchFlags
+			configureLaunchFlags(fs, &values, false)
+			values.modelsConfig = testModelsConfig()
+			args := append([]string{"DeepSeek-V4-Flash-Vision-Exp", "--config=local-test", "--tp=2"}, test.args...)
+			if err := fs.Parse(args); err != nil {
+				t.Fatal(err)
+			}
+			spec, err := buildSpec(context.Background(), fs, values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jsonOption := func(flag string) map[string]any {
+				t.Helper()
+				index := slices.Index(spec.VLLMArgv, flag)
+				if index < 0 || index+1 >= len(spec.VLLMArgv) {
+					t.Fatalf("missing %s in %v", flag, spec.VLLMArgv)
+				}
+				var value map[string]any
+				if err := json.Unmarshal([]byte(spec.VLLMArgv[index+1]), &value); err != nil {
+					t.Fatal(err)
+				}
+				return value
+			}
+			if test.name == "target-only" {
+				if slices.Contains(spec.VLLMArgv, "--speculative-config") {
+					t.Fatalf("target-only launch enables speculation: %v", spec.VLLMArgv)
+				}
+				return
+			}
+			draft := jsonOption("--speculative-config")
+			if draft["model"] != "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp" || draft["revision"] != "6821d6ad3681a4b137b066b76094fa82ebd0a380" ||
+				draft["method"] != "dspark" || draft["num_speculative_tokens"] != float64(7) || draft["draft_sample_method"] != "probabilistic" {
+				t.Fatalf("vision DSpark configuration: %v", draft)
+			}
+			if (draft["enable_adaptive_verification"] == true) != test.adaptive {
+				t.Fatalf("adaptive verification: got %v, want %v", draft["enable_adaptive_verification"], test.adaptive)
+			}
+			sizes := jsonOption("--compilation-config")["cudagraph_capture_sizes"].([]any)
+			if sizes[len(sizes)-1] != float64(64) {
+				t.Fatalf("vision DSpark capture envelope: %v", sizes)
+			}
+		})
 	}
 }
 

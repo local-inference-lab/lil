@@ -9,7 +9,7 @@ serving:
   async_scheduling: true
   generation_config: vllm
   long_prefill_token_threshold: 2048
-kernels:
+precision:
   quantization: modelopt_mixed
 speculators:
   default: mtp

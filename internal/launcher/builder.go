@@ -17,11 +17,16 @@ import (
 var containerNameSanitizer = regexp.MustCompile(`[^A-Za-z0-9_.-]`)
 
 var managedVLLMFlags = stringSet(
-	"--async-scheduling", "--attention-backend", "--block-size",
+	"--async-scheduling", "--attention-backend", "--attention-config", "--block-size",
 	"--compilation-config", "--dcp-comm-backend",
 	"--decode-context-parallel-size", "--disable-custom-all-reduce", "--dtype",
+	"--data-parallel-size", "--data-parallel-size-local", "--data-parallel-rank",
+	"--data-parallel-start-rank", "--data-parallel-address", "--data-parallel-rpc-port",
+	"--data-parallel-backend", "--data-parallel-hybrid-lb", "--data-parallel-external-lb",
+	"--data-parallel-multi-port-external-lb", "--data-parallel-supervisor-port",
 	"--enable-auto-tool-choice", "--enable-chunked-prefill",
-	"--enable-prefix-caching", "--gdn-decode-kernel", "--generation-config",
+	"--enable-prefix-caching", "--gdn-decode-kernel", "--gdn-prefill-backend", "--generation-config",
+	"--kda-prefill-backend", "--mamba-backend", "--recurrent-checkpoint-policy",
 	"--gpu-memory-utilization", "--hf-overrides", "--host", "--kv-cache-dtype",
 	"--kv-cache-memory-bytes", "--limit-mm-per-prompt", "--linear-backend",
 	"--load-format", "--long-prefill-token-threshold", "--mamba-cache-mode",
@@ -35,6 +40,9 @@ var managedVLLMFlags = stringSet(
 	"--device-ids", "--distributed-executor-backend", "--headless",
 	"--tokenizer-mode", "--scheduler-reserve-full-isl", "--enable-prompt-tokens-details",
 	"--prefill-schedule-interval",
+	"--prefill-compute-share", "--prefill-compute-half-life", "--max-parallel-prefills",
+	"--prefill-policy", "--decode-refill-target", "--jit-monitor-mode",
+	"--engram-config", "--safetensors-load-strategy",
 	"--enable-force-include-usage", "--enable-request-id-headers",
 	"--default-chat-template-kwargs", "--prefix-cache-retention-interval",
 	"--max-cudagraph-capture-size", "--cudagraph-capture-sizes",
@@ -47,12 +55,19 @@ var managedVLLMNegatedFlags = stringSet(
 	"--no-enable-prefix-caching", "--no-trust-remote-code", "--no-headless",
 	"--no-scheduler-reserve-full-isl", "--no-enable-prompt-tokens-details",
 	"--no-enable-force-include-usage", "--no-enable-request-id-headers",
+	"--no-data-parallel-hybrid-lb", "--no-data-parallel-external-lb",
+	"--no-data-parallel-multi-port-external-lb",
 )
 
 var vllmFlagAliases = map[string]string{
 	"-cc": "--compilation-config", "-dcp": "--decode-context-parallel-size",
 	"-n": "--nnodes", "-r": "--node-rank", "-pp": "--pipeline-parallel-size",
 	"-tp": "--tensor-parallel-size",
+	"-dp": "--data-parallel-size", "-dpl": "--data-parallel-size-local",
+	"-dpn": "--data-parallel-rank", "-dpr": "--data-parallel-start-rank",
+	"-dpa": "--data-parallel-address", "-dpp": "--data-parallel-rpc-port",
+	"-dpb": "--data-parallel-backend", "-dph": "--data-parallel-hybrid-lb",
+	"-dpe": "--data-parallel-external-lb", "-dpm": "--data-parallel-multi-port-external-lb",
 }
 
 func compactJSON(value any) (string, error) {
@@ -192,23 +207,27 @@ func resolveTPSize(facts *CheckpointFacts, topology Topology, requested *int, ut
 	return tpSize, defaultSize, nil
 }
 
-func resolveDevices(topology Topology, options LaunchOptions, tpSize int) ([]int, error) {
+func resolveDevices(topology Topology, options LaunchOptions, tpSize, dpSize int) ([]int, error) {
 	if topology.Spark != nil {
 		if options.DeviceIDs != nil {
 			return nil, fmt.Errorf("--devices is valid only for local topologies; Spark/RDMA device selection belongs to its YAML topology")
 		}
 		return nil, nil
 	}
+	if dpSize > topology.Local.MaxDevices()/tpSize {
+		return nil, fmt.Errorf("TP=%d with DP=%d exceeds topology %q's %d local GPUs; reduce --tp or --dp", tpSize, dpSize, topology.Name(), topology.Local.MaxDevices())
+	}
+	deviceCount := tpSize * dpSize
 	devices := options.DeviceIDs
 	var err error
 	if devices == nil {
-		devices, err = topology.Local.SelectDevices(tpSize)
+		devices, err = topology.Local.SelectDevices(deviceCount)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(devices) != tpSize {
-		return nil, fmt.Errorf("TP=%d requires %d device IDs; got %d", tpSize, tpSize, len(devices))
+	if len(devices) != deviceCount {
+		return nil, fmt.Errorf("TP=%d with DP=%d requires %d device IDs; got %d", tpSize, dpSize, deviceCount, len(devices))
 	}
 	seen := map[int]bool{}
 	for _, device := range devices {
@@ -310,6 +329,7 @@ func validateOptions(options LaunchOptions) error {
 		return fmt.Errorf("GPU memory utilization must be in (0, 1]")
 	}
 	positive := map[string]*int{
+		"DP size":                options.DPSize,
 		"max-num-seqs":           options.MaxNumSeqs,
 		"max-num-batched-tokens": options.MaxNumBatchedTokens,
 		"DCP size":               &options.DCPSize, "adaptive window": &options.AdaptiveWindow,
@@ -379,22 +399,23 @@ func mtpBackendDecision(policy MTPPolicy, facts *CheckpointFacts, dtype string) 
 	return decision, nil
 }
 
-func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource string, options LaunchOptions) (speculation, error) {
+func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource string, tpSize int, options LaunchOptions) (speculation, error) {
 	method := profile.Speculators.Default
 	if options.Speculator != nil {
 		method = *options.Speculator
 	}
 	result := speculation{Method: method}
+	adaptiveVerificationRequested := options.AdaptiveVerification != nil && *options.AdaptiveVerification
 	if method == "none" {
 		if options.AdaptiveSpeculativeTokens {
 			return result, fmt.Errorf("adaptive speculation requires an MTP launch")
 		}
-		if options.AdaptiveVerification {
+		if adaptiveVerificationRequested {
 			return result, fmt.Errorf("adaptive verification requires a DSpark launch")
 		}
 		return result, nil
 	}
-	if options.AdaptiveVerification && method != "dspark" {
+	if adaptiveVerificationRequested && method != "dspark" {
 		return result, fmt.Errorf("adaptive verification is supported only for DSpark")
 	}
 	if options.AdaptiveSpeculativeTokens && method != "mtp" {
@@ -436,6 +457,7 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 		}
 		config := map[string]any{
 			"method": "dspark", "model": modelSource, "num_speculative_tokens": tokens,
+			"draft_tensor_parallel_size": tpSize,
 		}
 		if profile.Revision != "" && modelSource == profile.Model {
 			config["revision"] = profile.Revision
@@ -449,8 +471,15 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 		if policy.Attention != nil {
 			config["attention_backend"] = *policy.Attention
 		}
-		if policy.AdaptiveVerification || options.AdaptiveVerification {
+		adaptiveVerification := policy.AdaptiveVerification
+		if options.AdaptiveVerification != nil {
+			adaptiveVerification = *options.AdaptiveVerification
+		}
+		if adaptiveVerification {
 			config["enable_adaptive_verification"] = true
+		}
+		if policy.AdaptiveVerificationCostScale != nil {
+			config["adaptive_verification_cost_scale"] = *policy.AdaptiveVerificationCostScale
 		}
 		encoded, err := compactJSON(config)
 		result.Config = &encoded
@@ -471,7 +500,7 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 			}
 			return result, nil
 		}
-		decision, err := mtpBackendDecision(*policy, facts, profile.Kernels.DType)
+		decision, err := mtpBackendDecision(*policy, facts, profile.Precision.DType)
 		if err != nil {
 			return result, err
 		}
@@ -568,6 +597,40 @@ func compilationConfig(settings LaunchSettings, maxNumSeqs, maxNumBatchedTokens 
 	return config
 }
 
+func validateServingPolicy(serving ServingPolicy, capacity Capacity) error {
+	valueOr := func(value *string, fallback string) string {
+		if value != nil {
+			return *value
+		}
+		return fallback
+	}
+	share := valueOr(serving.PrefillComputeShare, "")
+	if serving.PrefillComputeHalfLife != nil && share != "auto" {
+		return fmt.Errorf("serving.prefill_compute_half_life requires prefill_compute_share: auto")
+	}
+	if share != "" && serving.PrefillScheduleInterval != nil && *serving.PrefillScheduleInterval > 1 {
+		return fmt.Errorf("serving.prefill_compute_share cannot be combined with prefill_schedule_interval greater than one")
+	}
+	parallel := valueOr(serving.MaxParallelPrefills, "1")
+	policy := valueOr(serving.PrefillPolicy, "round-robin")
+	refill := valueOr(serving.DecodeRefillTarget, "auto")
+	for key, value := range map[string]string{"max_parallel_prefills": parallel, "decode_refill_target": refill} {
+		if count, err := strconv.Atoi(value); err == nil && count > capacity.MaxNumSeqs {
+			return fmt.Errorf("serving.%s cannot exceed resolved max_num_seqs (%d)", key, capacity.MaxNumSeqs)
+		}
+	}
+	if parallel == "1" && policy != "round-robin" {
+		return fmt.Errorf("serving.prefill_policy: decode-aware requires max_parallel_prefills greater than one or auto")
+	}
+	if refill != "auto" && policy != "decode-aware" {
+		return fmt.Errorf("serving.decode_refill_target requires prefill_policy: decode-aware")
+	}
+	if parallel != "1" && !serving.ChunkedPrefill {
+		return fmt.Errorf("serving.max_parallel_prefills requires chunked_prefill: true")
+	}
+	return nil
+}
+
 func profilerConfig(options LaunchOptions, topology Topology) (*string, error) {
 	if options.Profiler == nil {
 		return nil, nil
@@ -629,6 +692,7 @@ func validateExtraArgs(extraArgs []string) error {
 
 type argvInputs struct {
 	tpSize          int
+	dpSize          int
 	deviceIDs       []int
 	modelSource     string
 	servedModelName string
@@ -642,6 +706,7 @@ type argvInputs struct {
 
 func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOptions, in argvInputs) ([]string, error) {
 	serving, kernels := profile.Serving, profile.Kernels
+	precision, cache, loading := profile.Precision, profile.Cache, profile.Loading
 	var argv []string
 	if topology.Spark != nil {
 		argv = []string{topology.Spark.VLLMBin, "serve", in.modelSource}
@@ -668,34 +733,54 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 		appendOption(&argv, "--device-ids", stringPointer(strings.Join(parts, ",")))
 	}
 	appendOption(&argv, "--tensor-parallel-size", stringPointer(strconv.Itoa(in.tpSize)))
+	appendOption(&argv, "--data-parallel-size", stringPointer(strconv.Itoa(in.dpSize)))
 	appendOption(&argv, "--pipeline-parallel-size", stringPointer("1"))
 	appendOption(&argv, "--decode-context-parallel-size", stringPointer(strconv.Itoa(options.DCPSize)))
 	appendOption(&argv, "--dcp-comm-backend", &options.DCPCommBackend)
 	if topology.Spark != nil {
 		argv = append(argv, "--disable-custom-all-reduce")
 	}
-	appendOption(&argv, "--mamba-cache-mode", kernels.MambaCacheMode)
+	appendOption(&argv, "--mamba-cache-mode", cache.MambaCacheMode)
 	if serving.PrefixCaching {
 		argv = append(argv, "--enable-prefix-caching")
-		appendOption(&argv, "--prefix-cache-retention-interval", intPointerString(serving.PrefixCacheRetentionInterval))
+		appendOption(&argv, "--prefix-cache-retention-interval", intPointerString(cache.PrefixCacheRetentionInterval))
+	} else {
+		argv = append(argv, "--no-enable-prefix-caching")
 	}
 	if serving.ChunkedPrefill {
 		argv = append(argv, "--enable-chunked-prefill")
+	} else {
+		argv = append(argv, "--no-enable-chunked-prefill")
 	}
 	if serving.AsyncScheduling {
 		argv = append(argv, "--async-scheduling")
+	} else {
+		argv = append(argv, "--no-async-scheduling")
 	}
 	if !serving.SchedulerReserveFullISL {
 		argv = append(argv, "--no-scheduler-reserve-full-isl")
+	} else {
+		argv = append(argv, "--scheduler-reserve-full-isl")
 	}
-	appendOption(&argv, "--dtype", &kernels.DType)
+	appendOption(&argv, "--dtype", &precision.DType)
 	appendOption(&argv, "--kv-cache-dtype", &in.kvCacheDType)
-	appendOption(&argv, "--quantization", kernels.Quantization)
+	appendOption(&argv, "--quantization", precision.Quantization)
 	appendOption(&argv, "--attention-backend", kernels.Attention)
-	appendOption(&argv, "--block-size", intPointerString(kernels.BlockSize))
+	appendOption(&argv, "--block-size", intPointerString(cache.BlockSize))
 	appendOption(&argv, "--linear-backend", &kernels.Linear)
 	appendOption(&argv, "--moe-backend", &kernels.MoE)
 	appendOption(&argv, "--gdn-decode-kernel", kernels.GDNDecode)
+	appendOption(&argv, "--gdn-prefill-backend", kernels.GDNPrefill)
+	appendOption(&argv, "--kda-prefill-backend", kernels.KDAPrefill)
+	appendOption(&argv, "--mamba-backend", kernels.Mamba)
+	appendOption(&argv, "--recurrent-checkpoint-policy", cache.RecurrentCheckpointPolicy)
+	if cache.IndexerKVDType != nil {
+		value, err := compactJSON(map[string]string{"indexer_kv_dtype": *cache.IndexerKVDType})
+		if err != nil {
+			return nil, err
+		}
+		appendOption(&argv, "--attention-config", &value)
+	}
 	if kernels.FlashinferAutotune != nil {
 		if *kernels.FlashinferAutotune {
 			argv = append(argv, "--enable-flashinfer-autotune")
@@ -703,9 +788,17 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 			argv = append(argv, "--no-enable-flashinfer-autotune")
 		}
 	}
-	appendOption(&argv, "--load-format", &kernels.LoadFormat)
-	if kernels.LoaderExtraConfig != nil {
-		value, err := compactJSON(kernels.LoaderExtraConfig)
+	appendOption(&argv, "--load-format", &loading.LoadFormat)
+	appendOption(&argv, "--safetensors-load-strategy", loading.SafetensorsLoadStrategy)
+	if profile.Engram != nil {
+		value, err := compactJSON(profile.Engram)
+		if err != nil {
+			return nil, err
+		}
+		appendOption(&argv, "--engram-config", &value)
+	}
+	if loading.LoaderExtraConfig != nil {
+		value, err := compactJSON(loading.LoaderExtraConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -730,6 +823,12 @@ func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOption
 	}
 	appendOption(&argv, "--long-prefill-token-threshold", intPointerString(serving.LongPrefillTokenThreshold))
 	appendOption(&argv, "--prefill-schedule-interval", intPointerString(serving.PrefillScheduleInterval))
+	appendOption(&argv, "--prefill-compute-share", serving.PrefillComputeShare)
+	appendOption(&argv, "--prefill-compute-half-life", serving.PrefillComputeHalfLife)
+	appendOption(&argv, "--max-parallel-prefills", serving.MaxParallelPrefills)
+	appendOption(&argv, "--prefill-policy", serving.PrefillPolicy)
+	appendOption(&argv, "--decode-refill-target", serving.DecodeRefillTarget)
+	appendOption(&argv, "--jit-monitor-mode", serving.JITMonitorMode)
 	if serving.ReasoningParser != "" {
 		appendOption(&argv, "--reasoning-parser", &serving.ReasoningParser)
 	}
@@ -965,6 +1064,21 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 	if err := validateOptions(options); err != nil {
 		return LaunchSpec{}, err
 	}
+	dpSize := 1
+	if options.DPSize != nil {
+		dpSize = *options.DPSize
+	}
+	if topology.Spark != nil && dpSize != 1 {
+		return LaunchSpec{}, fmt.Errorf("--dp greater than 1 is supported only by local topologies; Spark/RDMA requires DP=1")
+	}
+	if dpSize > 1 {
+		if profile.prefillComputeSharingFromDefaults {
+			profile.Serving.PrefillComputeShare = nil
+			profile.Serving.PrefillComputeHalfLife = nil
+		} else if profile.Serving.PrefillComputeShare != nil || profile.Serving.PrefillComputeHalfLife != nil {
+			return LaunchSpec{}, fmt.Errorf("model %q explicitly configures prefill compute sharing, which vLLM does not support with DP=%d; set serving.prefill_compute_share and serving.prefill_compute_half_life to null in the manifest, or use --dp 1", profile.Name, dpSize)
+		}
+	}
 	if profile.Facts == nil {
 		return LaunchSpec{}, fmt.Errorf("model %q has no checkpoint facts; config.json was not resolved", profile.Name)
 	}
@@ -1004,7 +1118,7 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 	if err != nil {
 		return LaunchSpec{}, err
 	}
-	deviceIDs, err := resolveDevices(topology, options, tpSize)
+	deviceIDs, err := resolveDevices(topology, options, tpSize, dpSize)
 	if err != nil {
 		return LaunchSpec{}, err
 	}
@@ -1020,7 +1134,7 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 	if options.Port != nil {
 		port = *options.Port
 	}
-	spec, err := speculativeConfig(profile, facts, modelSource, options)
+	spec, err := speculativeConfig(profile, facts, modelSource, tpSize, options)
 	if err != nil {
 		return LaunchSpec{}, err
 	}
@@ -1029,17 +1143,26 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 		return LaunchSpec{}, err
 	}
 	capacity := resolveCapacity(settings, topology, options)
+	if err := validateServingPolicy(profile.Serving, capacity); err != nil {
+		return LaunchSpec{}, err
+	}
+	if profile.Engram != nil && !contains(facts.Architectures, "DeepseekV41ForCausalLM") {
+		return LaunchSpec{}, fmt.Errorf("engram requires the DeepseekV41ForCausalLM architecture")
+	}
+	if profile.Loading.LoadFormat == "" {
+		profile.Loading.LoadFormat = topology.DefaultLoadFormat()
+	}
 	needsNVRTC := spec.Decision != nil && spec.Decision.Backend == "humming"
-	environment, unsetEnvironment, err := runtimeEnvironment(topology, settings, options, needsNVRTC)
+	environment, unsetEnvironment, err := runtimeEnvironment(topology, settings, options, needsNVRTC, profile.Loading.LoadFormat)
 	if err != nil {
 		return LaunchSpec{}, err
 	}
-	kvCacheDType := profile.Kernels.KVCacheDType
+	kvCacheDType := profile.Cache.KVCacheDType
 	if options.KVCacheDType != nil {
 		kvCacheDType = *options.KVCacheDType
 	}
 	vllmArgv, err := buildVLLMArgv(profile, topology, options, argvInputs{
-		tpSize: tpSize, deviceIDs: deviceIDs, modelSource: modelSource,
+		tpSize: tpSize, dpSize: dpSize, deviceIDs: deviceIDs, modelSource: modelSource,
 		servedModelName: servedModelName, host: host, port: port,
 		capacity: capacity, settings: settings, speculation: spec, kvCacheDType: kvCacheDType,
 	})
@@ -1055,6 +1178,7 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 		"kv_cache_dtype": kvCacheDType, "memory": memory,
 		"manifest_commit": profile.ManifestCommit, "family": profile.Family,
 		"repository": profile.Model, "revision": profile.Revision,
+		"data_parallel":    map[string]any{"size": dpSize, "default": 1},
 		"checkpoint_facts": factsMetadata(facts), "applied_overrides": appliedOverrides,
 		"tensor_parallel": map[string]any{
 			"size": tpSize, "default": defaultTP, "policy": topology.DefaultTP,
@@ -1076,7 +1200,7 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 		downloads = append(downloads, RepositoryDownload{Repository: profile.Speculators.DFlash.Model})
 	}
 	launch := LaunchSpec{
-		Model: profile, Topology: topology, TPSize: tpSize, ModelSource: modelSource,
+		Model: profile, Topology: topology, TPSize: tpSize, DPSize: dpSize, ModelSource: modelSource,
 		CheckpointPath: checkpointPath, ServedModelName: servedModelName, Host: host, Port: port,
 		Detach: options.Detach, SyncCode: options.SyncCode, SyncModel: options.SyncModel,
 		Downloads: downloads, RuntimeEnvironment: environment,

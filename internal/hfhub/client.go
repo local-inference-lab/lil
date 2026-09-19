@@ -134,15 +134,23 @@ func huggingFaceToken() string {
 			return token
 		}
 	}
-	hfHome := os.Getenv("HF_HOME")
-	if hfHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return ""
+	tokenPath := os.Getenv("HF_TOKEN_PATH")
+	if tokenPath == "" {
+		hfHome := os.Getenv("HF_HOME")
+		if hfHome == "" {
+			cache := os.Getenv("XDG_CACHE_HOME")
+			if cache == "" {
+				home, err := os.UserHomeDir()
+				if err != nil {
+					return ""
+				}
+				cache = filepath.Join(home, ".cache")
+			}
+			hfHome = filepath.Join(cache, "huggingface")
 		}
-		hfHome = filepath.Join(home, ".cache", "huggingface")
+		tokenPath = filepath.Join(hfHome, "token")
 	}
-	data, err := os.ReadFile(filepath.Join(hfHome, "token"))
+	data, err := os.ReadFile(tokenPath)
 	if err != nil {
 		return ""
 	}

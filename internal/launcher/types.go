@@ -173,6 +173,14 @@ func (t Topology) CuteDSLArch() string {
 	return t.Spark.CuteDSLArch
 }
 
+// DefaultLoadFormat selects the weight loader for the execution platform.
+func (t Topology) DefaultLoadFormat() string {
+	if t.Spark != nil || t.CuteDSLArch() == "sm_121a" {
+		return "b12x"
+	}
+	return "instanttensor"
+}
+
 // Environment returns the host tuning recorded by discovery for this topology.
 func (t Topology) Environment() map[string]string {
 	if t.Local != nil {
@@ -249,41 +257,68 @@ type MultimodalPolicy struct {
 }
 
 type ServingPolicy struct {
-	ServedModelName              string
-	TrustRemoteCode              bool
-	TokenizerMode                string
-	ReasoningParser              string
-	ToolCallParser               string
-	AutoToolChoice               bool
-	GenerationConfig             *string
-	HFOverrides                  map[string]any
-	ChatTemplateKwargs           map[string]any
-	AsyncScheduling              bool
-	SchedulerReserveFullISL      bool
-	PrefixCaching                bool
+	ServedModelName           string
+	TrustRemoteCode           bool
+	TokenizerMode             string
+	ReasoningParser           string
+	ToolCallParser            string
+	AutoToolChoice            bool
+	GenerationConfig          *string
+	HFOverrides               map[string]any
+	ChatTemplateKwargs        map[string]any
+	AsyncScheduling           bool
+	SchedulerReserveFullISL   bool
+	PrefixCaching             bool
+	ChunkedPrefill            bool
+	LongPrefillTokenThreshold *int
+	PrefillScheduleInterval   *int
+	PrefillComputeShare       *string
+	PrefillComputeHalfLife    *string
+	MaxParallelPrefills       *string
+	PrefillPolicy             *string
+	DecodeRefillTarget        *string
+	JITMonitorMode            *string
+	PromptTokensDetails       bool
+	ForceIncludeUsage         bool
+	RequestIDHeaders          bool
+	Multimodal                *MultimodalPolicy
+}
+
+type PrecisionPolicy struct {
+	DType        string
+	Quantization *string
+}
+
+type CachePolicy struct {
+	KVCacheDType                 string
+	IndexerKVDType               *string
+	BlockSize                    *int
+	MambaCacheMode               *string
+	RecurrentCheckpointPolicy    *string
 	PrefixCacheRetentionInterval *int
-	ChunkedPrefill               bool
-	LongPrefillTokenThreshold    *int
-	PrefillScheduleInterval      *int
-	PromptTokensDetails          bool
-	ForceIncludeUsage            bool
-	RequestIDHeaders             bool
-	Multimodal                   *MultimodalPolicy
 }
 
 type KernelPolicy struct {
-	DType              string
-	KVCacheDType       string
-	Quantization       *string
 	Attention          *string
 	Linear             string
 	MoE                string
 	GDNDecode          *string
-	BlockSize          *int
-	MambaCacheMode     *string
+	GDNPrefill         *string
+	KDAPrefill         *string
+	Mamba              *string
 	FlashinferAutotune *bool
-	LoadFormat         string
-	LoaderExtraConfig  map[string]any
+}
+
+type LoadingPolicy struct {
+	LoadFormat              string
+	SafetensorsLoadStrategy *string
+	LoaderExtraConfig       map[string]any
+}
+
+type EngramPolicy struct {
+	CPUOffload         bool   `json:"cpu_offload"`
+	TableMemory        string `json:"table_memory"`
+	DiskResidentScales bool   `json:"disk_resident_scales"`
 }
 
 type MTPPolicy struct {
@@ -304,11 +339,12 @@ type DFlashPolicy struct {
 // DSparkPolicy describes a DeepSeek DSpark draft, which ships inside the
 // target checkpoint.
 type DSparkPolicy struct {
-	Tokens                int
-	Attention             *string
-	DraftSampleMethod     *string
-	RejectionSampleMethod *string
-	AdaptiveVerification  bool
+	Tokens                        int
+	Attention                     *string
+	DraftSampleMethod             *string
+	RejectionSampleMethod         *string
+	AdaptiveVerification          bool
+	AdaptiveVerificationCostScale *float64
 }
 
 type SpeculatorPolicy struct {
@@ -341,12 +377,18 @@ type ModelProfile struct {
 	ManifestCommit string
 	Family         string
 	Serving        ServingPolicy
+	Precision      PrecisionPolicy
+	Cache          CachePolicy
+	Loading        LoadingPolicy
+	Engram         *EngramPolicy
 	Kernels        KernelPolicy
 	Speculators    SpeculatorPolicy
 	Base           LaunchLayer
 	Overrides      []LaunchOverride
 	Requires       Requirements
 	Facts          *CheckpointFacts
+	// Both compute-sharing settings are inherited from launcher defaults.
+	prefillComputeSharingFromDefaults bool
 }
 
 type ProfilerOptions struct {
@@ -366,6 +408,7 @@ type EnvironmentOverride struct {
 
 type LaunchOptions struct {
 	TPSize                    *int
+	DPSize                    *int
 	DeviceIDs                 []int
 	ModelPath                 *string
 	ServedModelName           *string
@@ -384,7 +427,7 @@ type LaunchOptions struct {
 	AdaptiveSpeculativeTokens bool
 	AdaptiveWindow            int
 	AdaptiveInitial           *int
-	AdaptiveVerification      bool
+	AdaptiveVerification      *bool
 	PLECPUOffload             *bool
 	B12XPolicyMode            string
 	Profiler                  *ProfilerOptions
@@ -415,6 +458,7 @@ type LaunchSpec struct {
 	Model              ModelProfile
 	Topology           Topology
 	TPSize             int
+	DPSize             int
 	ModelSource        string
 	CheckpointPath     *string
 	ServedModelName    string

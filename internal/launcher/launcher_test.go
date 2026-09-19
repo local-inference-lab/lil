@@ -22,6 +22,7 @@ const (
 	glmProfile            = "GLM-5.3-NVFP4"
 	glmSparkProfile       = "GLM-5.3-NVFP4-Spark"
 	deepseekProfile       = "DeepSeek-V4-Flash-0731"
+	deepseek41Profile     = "DeepSeek-V4.1-Flash"
 	deepseekVisionProfile = "DeepSeek-V4-Flash-Vision-Exp"
 	deepseekRevision      = "9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
 	deepseekStandard      = "DeepSeek-V4-Flash"
@@ -193,7 +194,7 @@ func loadManifest(t *testing.T, families []byte, name, manifest string) (ModelPr
 func TestProfileNamesMatchHuggingFaceRepositories(t *testing.T) {
 	config := loadTestConfig(t)
 	want := []string{
-		deepseekStandard, deepseekProfile, deepseekVisionProfile,
+		deepseekStandard, deepseekProfile, deepseekVisionProfile, deepseek41Profile,
 		glmFlashProfile, glmFlashSparkProfile, glmProfile, glmSparkProfile,
 		qwenProfile,
 	}
@@ -280,11 +281,11 @@ func TestFamilyValuesMergeAndExplicitNullClears(t *testing.T) {
 	glm := config.profiles[glmProfile]
 	if glm.Serving.ReasoningParser != "glm45" || glm.Serving.ToolCallParser != "glm47" ||
 		!glm.Serving.AutoToolChoice || glm.Base.Environment["VLLM_B12X_MOE_FP4_FORCE_A16"] != "1" ||
-		glm.Base.Environment["CUDA_DEVICE_MAX_CONNECTIONS"] != "32" || glm.Kernels.MambaCacheMode != nil {
+		glm.Base.Environment["CUDA_DEVICE_MAX_CONNECTIONS"] != "32" || glm.Cache.MambaCacheMode != nil {
 		t.Fatalf("GLM family values were not merged: %+v", glm)
 	}
 	flash := config.profiles[glmFlashProfile]
-	if flash.Kernels.MambaCacheMode == nil || flash.Base.Environment["VLLM_SSM_CONV_STATE_LAYOUT"] != "DS" {
+	if flash.Cache.MambaCacheMode == nil || flash.Base.Environment["VLLM_SSM_CONV_STATE_LAYOUT"] != "DS" {
 		t.Fatalf("GLM Flash recurrent settings: %+v", flash)
 	}
 	profile, err := loadManifest(t, config.families, "Cleared", `schema_version: 1
@@ -473,8 +474,7 @@ func TestOverridesApplyByTPAndKind(t *testing.T) {
 		}
 	}
 	local1, _ := BuildLaunchSpec(qwen, config.local, defaultOptions(1))
-	if local1.RuntimeEnvironment["INSTANTTENSOR_BUFFER_SIZE"] != "1342177280" ||
-		optionValue(t, local1.VLLMArgv, "--kv-cache-memory-bytes") != "1610612736" ||
+	if optionValue(t, local1.VLLMArgv, "--kv-cache-memory-bytes") != "1610612736" ||
 		optionValue(t, local1.VLLMArgv, "--max-model-len") != "65536" ||
 		optionValue(t, local1.VLLMArgv, "--max-num-seqs") != "1" {
 		t.Fatalf("TP=1 profile: %+v %v", local1.RuntimeEnvironment, local1.VLLMArgv)
@@ -500,9 +500,6 @@ func TestEnvironmentLayersTopologyDerivedManifestAndCLI(t *testing.T) {
 		"B12X_POLICY_MODE":            "auto",
 		"VLLM_SSM_CONV_STATE_LAYOUT":  "DS",
 		"VLLM_B12X_MOE_FP4_FORCE_A16": "1",
-		"INSTANTTENSOR_BUFFER_SIZE":   "67108864",
-		"INSTANTTENSOR_CHUNK_SIZE":    "8388608",
-		"INSTANTTENSOR_IO_DEPTH":      "3",
 		"OMP_NUM_THREADS":             "8",
 		"MY_EXPERIMENT":               "1",
 	} {
@@ -547,7 +544,7 @@ func TestSparkEnvironmentUsesRecordedTuningAndDerivedRankValues(t *testing.T) {
 		"NCCL_IB_MERGE_NICS":         "1",
 		"NCCL_DEBUG":                 "INFO",
 		"NCCL_NET_PLUGIN":            "none",
-		"INSTANTTENSOR_BUFFER_SIZE":  "1342177280",
+		"VLLM_PLUGINS":               "b12x_loader",
 		"PYTHONPATH":                 "/home/luke/projects/vllm:/home/luke/projects/b12x",
 	} {
 		if got := spec.RuntimeEnvironment[name]; got != want {
@@ -561,6 +558,78 @@ func TestSparkEnvironmentUsesRecordedTuningAndDerivedRankValues(t *testing.T) {
 	}
 	if !slices.Contains(spec.VLLMArgv, "--disable-custom-all-reduce") {
 		t.Fatalf("Spark launch must disable custom all-reduce: %v", spec.VLLMArgv)
+	}
+}
+
+func TestLoaderDefaultsFollowPlatformAndPreserveModelOverrides(t *testing.T) {
+	config := loadTestConfig(t)
+	localSpark := config.local
+	localCopy := *localSpark.Local
+	localCopy.CuteDSLArch = "sm_121a"
+	localSpark.Local = &localCopy
+	for _, test := range []struct {
+		name     string
+		topology Topology
+		override string
+		loader   string
+		plugins  string
+	}{
+		{"pcie", config.local, "", "instanttensor", ""},
+		{"spark-rdma", config.spark, "", "b12x", "b12x_loader"},
+		{"spark-local", localSpark, "", "b12x", "b12x_loader"},
+		{"spark-override", config.spark, "instanttensor", "instanttensor", ""},
+		{"model-override", config.local, "safetensors", "safetensors", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for name, profile := range config.profiles {
+				if len(profile.Requires.Arch) > 0 && !contains(profile.Requires.Arch, test.topology.CuteDSLArch()) {
+					continue
+				}
+				if profile.Loading.LoadFormat != "" || len(profile.Loading.LoaderExtraConfig) != 0 {
+					t.Fatalf("%s embeds loader defaults: %+v", name, profile.Loading)
+				}
+				profile.Loading.LoadFormat = test.override
+				spec, err := BuildLaunchSpec(profile, test.topology, defaultOptions(2))
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				if got := optionValue(t, spec.VLLMArgv, "--load-format"); got != test.loader {
+					t.Errorf("%s loader: got %q, want %q", name, got, test.loader)
+				}
+				if got := spec.RuntimeEnvironment["VLLM_PLUGINS"]; got != test.plugins {
+					t.Errorf("%s plugins: got %q, want %q", name, got, test.plugins)
+				}
+				if slices.Contains(spec.VLLMArgv, "--model-loader-extra-config") {
+					t.Errorf("%s configures loader tuning: %v", name, spec.VLLMArgv)
+				}
+				for key := range spec.RuntimeEnvironment {
+					if strings.HasPrefix(key, "INSTANTTENSOR_") && spec.RuntimeEnvironment[key] != profile.Base.Environment[key] {
+						t.Errorf("%s did not preserve %s from its manifest", name, key)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLoaderPluginDefaultsPreserveConfiguredPluginsAndCLIOverrides(t *testing.T) {
+	config := loadTestConfig(t)
+	config.spark.Spark.Environment["VLLM_PLUGINS"] = "custom_plugin"
+	spec, err := BuildLaunchSpec(config.profiles[qwenProfile], config.spark, defaultOptions(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.RuntimeEnvironment["VLLM_PLUGINS"]; got != "custom_plugin,b12x_loader" {
+		t.Fatalf("loader plugins: %q", got)
+	}
+	options := defaultOptions(2)
+	options.EnvironmentOverrides = []EnvironmentOverride{{"VLLM_PLUGINS", "custom_override"}}
+	spec, err = BuildLaunchSpec(config.profiles[qwenProfile], config.spark, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.RuntimeEnvironment["VLLM_PLUGINS"]; got != "custom_override" {
+		t.Fatalf("explicit plugin override: %q", got)
 	}
 }
 
@@ -591,20 +660,19 @@ func TestQwenMultimodalAndKernelContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	for flag, want := range map[string]string{
-		"--mm-encoder-tp-mode":        "data",
-		"--mm-processor-cache-gb":     "0",
-		"--limit-mm-per-prompt":       `{"image":1}`,
-		"--gdn-decode-kernel":         "b12x",
-		"--block-size":                "16",
-		"--mamba-cache-mode":          "align",
-		"--model-loader-extra-config": `{"instanttensor_copy":false}`,
-		"--reasoning-parser":          "qwen3",
-		"--tool-call-parser":          "qwen3_xml",
-		"--max-model-len":             "65536",
-		"--max-num-seqs":              "1",
-		"--kv-cache-dtype":            "bfloat16",
-		"--gpu-memory-utilization":    "0.94",
-		"--quantization":              "modelopt_mixed",
+		"--mm-encoder-tp-mode":     "data",
+		"--mm-processor-cache-gb":  "0",
+		"--limit-mm-per-prompt":    `{"image":1}`,
+		"--gdn-decode-kernel":      "b12x",
+		"--block-size":             "16",
+		"--mamba-cache-mode":       "align",
+		"--reasoning-parser":       "qwen3",
+		"--tool-call-parser":       "qwen3_xml",
+		"--max-model-len":          "65536",
+		"--max-num-seqs":           "1",
+		"--kv-cache-dtype":         "bfloat16",
+		"--gpu-memory-utilization": "0.94",
+		"--quantization":           "modelopt_mixed",
 	} {
 		if got := optionValue(t, spec.VLLMArgv, flag); got != want {
 			t.Errorf("%s: got %q, want %q", flag, got, want)
@@ -649,6 +717,7 @@ description: Base model without tool calling or speculation
 serving:
   served_model_name: plain
   prefix_caching: false
+compilation: null
 `)
 	if err != nil {
 		t.Fatal(err)
@@ -932,13 +1001,8 @@ func TestGLMFlashSparkPolicyMatchesRDMAContract(t *testing.T) {
 	if slices.Contains(spec.VLLMArgv, "--kv-cache-memory-bytes") {
 		t.Fatalf("Spark policy must leave KV sizing to vLLM: %v", spec.VLLMArgv)
 	}
-	for name, want := range map[string]string{
-		"INSTANTTENSOR_BUFFER_SIZE": "67108864",
-		"INSTANTTENSOR_CHUNK_SIZE":  "8388608",
-	} {
-		if got := spec.RuntimeEnvironment[name]; got != want {
-			t.Errorf("%s: got %q, want %q", name, got, want)
-		}
+	if got := optionValue(t, spec.VLLMArgv, "--load-format"); got != "b12x" {
+		t.Errorf("Spark load format: got %q, want b12x", got)
 	}
 }
 
@@ -1339,7 +1403,8 @@ func TestDeepSeekOverridesFollowTheSpeculator(t *testing.T) {
 		t.Fatalf("standard checkpoint launch: %+v %v", speculative, standard.VLLMArgv)
 	}
 	options = defaultOptions(2)
-	options.AdaptiveVerification = true
+	adaptiveVerification := true
+	options.AdaptiveVerification = &adaptiveVerification
 	spec, err := BuildLaunchSpec(config.profiles[deepseekProfile], config.local, options)
 	if err != nil {
 		t.Fatal(err)
@@ -1393,6 +1458,8 @@ func TestManifestUtilizationAndPrefillIntervalAreEmitted(t *testing.T) {
 	interval := 8
 	profile := config.profiles[glmFlashProfile]
 	profile.Serving.PrefillScheduleInterval = &interval
+	profile.Serving.PrefillComputeShare = nil
+	profile.Serving.PrefillComputeHalfLife = nil
 	spec, err := BuildLaunchSpec(profile, config.local, defaultOptions(4))
 	if err != nil {
 		t.Fatal(err)

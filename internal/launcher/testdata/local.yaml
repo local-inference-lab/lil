@@ -21,7 +21,6 @@ device_pools:
   - [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 environment:
   CUDA_DEVICE_ORDER: PCI_BUS_ID
-  INSTANTTENSOR_BACKEND: BUFFERED
   NCCL_IB_DISABLE: "1"
   NCCL_P2P_LEVEL: SYS
   NCCL_PROTO: LL,LL128,Simple

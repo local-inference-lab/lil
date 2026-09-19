@@ -41,7 +41,7 @@ A family is implemented when the Go launcher can represent its environment and
 vLLM arguments without shell evaluation or untyped argument blobs. A manifest
 is qualified when:
 
-1. Its `serving` and `kernels` sections agree with `config.json` at the
+1. Its `serving`, `precision`, `cache`, and `kernels` sections agree with `config.json` at the
    resolved commit, and any `moe_quantization` assertion matches the
    checkpoint's quantization metadata.
 2. Every topology-supported TP size that divides its attention heads renders.
@@ -123,10 +123,21 @@ MegaMoE and multi-stream GEMM environment. Three catalog entries use it.
 - `DeepSeek-V4-Flash` is the standard checkpoint with its MTP head at depth
   2, the depth the lab's decode sweeps found best, at 64 sequences and 0.91
   utilization. Status: implemented, preflight-qualified.
-- `DeepSeek-V4-Flash-Vision-Exp` carries the 0731 policy pinned to its first
-  published commit. This vLLM tree registers no vision tower for the V4
-  architecture, so the entry serves the text model only and its vision weights
-  are outside the launcher's contract. Status: research-only.
+- `DeepSeek-V4-Flash-Vision-Exp` pins checkpoint revision
+  `6821d6ad3681a4b137b066b76094fa82ebd0a380` and uses the 0731 B12X,
+  capacity, and compilation policy. DSpark defaults to depth 7 with
+  probabilistic drafting and adaptive verification; `--speculative-tokens`
+  overrides the maximum depth. The inherited `deepseek_v4` parser and vLLM
+  defaults produce the [model card's](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/blob/6821d6ad3681a4b137b066b76094fa82ebd0a380/README.md)
+  reasoning configuration with empty start/end strings.
+  The eight-sequence default produces a 64-row graph envelope. Image
+  preprocessing uses the checkpoint's vision configuration; the profile does
+  not override processor settings or grant access to local media files.
+  Vision serving requires vLLM's [DeepSeek V4 vision implementation](https://github.com/vllm-project/vllm/pull/54566).
+  A runtime that registers only the text architecture cannot serve images.
+  Adaptive verification also requires every target metadata builder, including
+  SWA, to report `AttentionCGSupport.ALWAYS` for variable-length CUDA graphs.
+  Status: implemented profile; vision inference on SM120 has not been validated.
 
 The entries keep `max_model_len: auto` so the runtime profile sizes the KV
 cache; the references fix 131072 or 1048576 tokens. At TP 2 the 0731 entry

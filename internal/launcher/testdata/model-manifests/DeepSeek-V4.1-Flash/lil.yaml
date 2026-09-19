@@ -1,0 +1,46 @@
+schema_version: 1
+kind: model
+model: deepseek-ai/DeepSeek-V4.1-Flash
+revision: fb2764a5cf321eaa5070ca8f9e892818f477c16d
+description: DeepSeek V4.1 Flash with native KV cache, disk-backed Engram tables, and adaptive DSpark verification
+serving:
+  served_model_name: DeepSeek-V4.1-Flash
+  tokenizer_mode: deepseek_v41
+  reasoning_parser: deepseek_v41
+  tool_call_parser: deepseek_v41
+  jit_monitor_mode: error
+  chat_template_kwargs:
+    thinking: true
+    reasoning_effort: high
+cache:
+  kv_cache_dtype: auto
+  block_size: 256
+kernels:
+  attention: B12X
+loading:
+  safetensors_load_strategy: lazy
+engram:
+  cpu_offload: false
+  table_memory: disk
+  disk_resident_scales: false
+speculators:
+  default: dspark
+  dspark:
+    tokens: 7
+    model: target
+    attention: B12X
+    draft_sample_method: greedy
+    rejection_sample_method: standard
+    adaptive_verification: true
+    adaptive_verification_cost_scale: 1.0
+capacity:
+  gpu_memory_utilization: 0.98
+  max_model_len: auto
+  max_num_seqs: 8
+  max_num_batched_tokens: 4096
+environment:
+  VLLM_B12X_MOE_FP4_FORCE_A16: "0"
+  INSTANTTENSOR_BACKEND: BUFFERED
+requires:
+  arch:
+    - sm_120a

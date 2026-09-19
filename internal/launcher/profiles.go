@@ -5,6 +5,7 @@ package launcher
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,7 +25,6 @@ const (
 	defaultKVCacheDType = "fp8"
 	defaultLinear       = "b12x"
 	defaultMoE          = "b12x"
-	defaultLoadFormat   = "instanttensor"
 	defaultMTPTokens    = 3
 )
 
@@ -36,8 +36,8 @@ var capacityKeys = []string{
 var speculatorMethods = stringSet("mtp", "dflash", "dspark", "none")
 
 var manifestSections = []string{
-	"description", "serving", "kernels", "speculators", "capacity",
-	"compilation", "environment", "requires", "overrides",
+	"description", "serving", "precision", "cache", "kernels", "loading", "speculators", "capacity",
+	"compilation", "environment", "engram", "requires", "overrides",
 }
 
 func normalizeYAML(value any) (any, error) {
@@ -178,34 +178,49 @@ func schemaVersionOf(document map[string]any, label string) error {
 
 // LoadFamilies parses the embedded family bases document.
 func LoadFamilies(data []byte, label string) (map[string]map[string]any, error) {
+	_, families, err := loadModelBases(data, label)
+	return families, err
+}
+
+func loadModelBases(data []byte, label string) (map[string]any, map[string]map[string]any, error) {
 	document, err := parseYAMLDocument(data, label)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := checkKeys(document, label, []string{"schema_version"}, []string{"families"}); err != nil {
-		return nil, err
+	if err := checkKeys(document, label, []string{"schema_version"}, []string{"defaults", "families"}); err != nil {
+		return nil, nil, err
 	}
 	if err := schemaVersionOf(document, label); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	defaults := map[string]any{}
+	if raw := document["defaults"]; raw != nil {
+		defaults, err = mapping(raw, label+".defaults")
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := checkKeys(defaults, label+".defaults", nil, manifestSections); err != nil {
+			return nil, nil, err
+		}
 	}
 	families := map[string]map[string]any{}
 	if raw, ok := document["families"]; ok && raw != nil {
 		table, err := mapping(raw, label+".families")
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for name, value := range table {
 			family, err := mapping(value, label+".families."+name)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if err := checkKeys(family, label+".families."+name, nil, append([]string{"family"}, manifestSections...)); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			families[name] = family
 		}
 	}
-	return families, nil
+	return defaults, families, nil
 }
 
 func resolveFamily(families map[string]map[string]any, name string, visiting []string) (map[string]any, error) {
@@ -351,6 +366,39 @@ func (s section) optionalMapping(key string) (map[string]any, error) {
 	return cloneValue(value).(map[string]any), nil
 }
 
+func (s section) optionalNumericSelector(key string, presets []string, integer, fraction bool) (*string, error) {
+	if !s.present(key) {
+		return nil, nil
+	}
+	var value string
+	switch raw := s.data[key].(type) {
+	case string:
+		value = raw
+	case int:
+		value = strconv.Itoa(raw)
+	case float64:
+		value = strconv.FormatFloat(raw, 'g', -1, 64)
+	default:
+		return nil, fmt.Errorf("%s.%s must be a number, %s, or null", s.context, key, strings.Join(presets, ", "))
+	}
+	if contains(presets, value) {
+		return &value, nil
+	}
+	number, err := strconv.ParseFloat(value, 64)
+	valid := err == nil && number > 0 && !math.IsInf(number, 0) && !math.IsNaN(number)
+	if integer {
+		_, err := strconv.Atoi(value)
+		valid = valid && err == nil
+	}
+	if fraction {
+		valid = valid && number < 1
+	}
+	if !valid {
+		return nil, fmt.Errorf("%s.%s has invalid value %q", s.context, key, value)
+	}
+	return &value, nil
+}
+
 func (s section) optionalStringList(key string) ([]string, error) {
 	if !s.present(key) {
 		return nil, nil
@@ -488,7 +536,8 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 		"trust_remote_code", "tokenizer_mode", "reasoning_parser", "tool_call_parser",
 		"auto_tool_choice", "generation_config", "hf_overrides", "chat_template_kwargs",
 		"async_scheduling", "scheduler_reserve_full_isl", "prefix_caching",
-		"prefix_cache_retention_interval", "chunked_prefill",
+		"chunked_prefill", "prefill_compute_share", "prefill_compute_half_life",
+		"max_parallel_prefills", "prefill_policy", "decode_refill_target", "jit_monitor_mode",
 		"long_prefill_token_threshold", "prefill_schedule_interval",
 		"prompt_tokens_details", "force_include_usage", "request_id_headers", "multimodal",
 	}); err != nil {
@@ -544,9 +593,6 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 	if policy.PrefixCaching, err = s.boolOr("prefix_caching", true); err != nil {
 		return policy, err
 	}
-	if policy.PrefixCacheRetentionInterval, err = s.optionalNonNegativeInt("prefix_cache_retention_interval"); err != nil {
-		return policy, err
-	}
 	if policy.ChunkedPrefill, err = s.boolOr("chunked_prefill", true); err != nil {
 		return policy, err
 	}
@@ -555,6 +601,30 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 	}
 	if policy.PrefillScheduleInterval, err = s.optionalPositiveInt("prefill_schedule_interval"); err != nil {
 		return policy, err
+	}
+	if policy.PrefillComputeShare, err = s.optionalNumericSelector("prefill_compute_share", []string{"auto"}, false, true); err != nil {
+		return policy, err
+	}
+	if policy.PrefillComputeHalfLife, err = s.optionalNumericSelector("prefill_compute_half_life", []string{"smooth", "responsive"}, false, false); err != nil {
+		return policy, err
+	}
+	if policy.MaxParallelPrefills, err = s.optionalNumericSelector("max_parallel_prefills", []string{"auto"}, true, false); err != nil {
+		return policy, err
+	}
+	if policy.DecodeRefillTarget, err = s.optionalNumericSelector("decode_refill_target", []string{"auto"}, true, false); err != nil {
+		return policy, err
+	}
+	if policy.PrefillPolicy, err = s.optionalString("prefill_policy"); err != nil {
+		return policy, err
+	}
+	if policy.PrefillPolicy != nil && !contains([]string{"round-robin", "decode-aware"}, *policy.PrefillPolicy) {
+		return policy, fmt.Errorf("%s.prefill_policy must be round-robin or decode-aware", s.context)
+	}
+	if policy.JITMonitorMode, err = s.optionalString("jit_monitor_mode"); err != nil {
+		return policy, err
+	}
+	if policy.JITMonitorMode != nil && !contains([]string{"warn", "error"}, *policy.JITMonitorMode) {
+		return policy, fmt.Errorf("%s.jit_monitor_mode must be warn or error", s.context)
 	}
 	if policy.PromptTokensDetails, err = s.boolOr("prompt_tokens_details", false); err != nil {
 		return policy, err
@@ -601,29 +671,61 @@ func parseServing(data map[string]any, context string) (ServingPolicy, error) {
 	return policy, nil
 }
 
-func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
-	policy := KernelPolicy{
-		DType: defaultDType, KVCacheDType: defaultKVCacheDType, Linear: defaultLinear,
-		MoE: defaultMoE, LoadFormat: defaultLoadFormat,
-	}
-	s, ok, err := subsection(data, "kernels", context)
+func parsePrecision(data map[string]any, context string) (PrecisionPolicy, error) {
+	policy := PrecisionPolicy{DType: defaultDType}
+	s, ok, err := subsection(data, "precision", context)
 	if err != nil || !ok {
 		return policy, err
 	}
-	if err := checkKeys(s.data, s.context, nil, []string{
-		"dtype", "kv_cache_dtype", "quantization", "attention", "linear", "moe", "gdn_decode",
-		"block_size", "mamba_cache_mode", "flashinfer_autotune", "load_format",
-		"loader_extra_config",
-	}); err != nil {
+	if err := checkKeys(s.data, s.context, nil, []string{"dtype", "quantization"}); err != nil {
 		return policy, err
 	}
 	if policy.DType, err = s.stringOr("dtype", defaultDType); err != nil {
 		return policy, err
 	}
+	if policy.Quantization, err = s.optionalString("quantization"); err != nil {
+		return policy, err
+	}
+	return policy, nil
+}
+
+func parseCache(data map[string]any, context string) (CachePolicy, error) {
+	policy := CachePolicy{KVCacheDType: defaultKVCacheDType}
+	s, ok, err := subsection(data, "cache", context)
+	if err != nil || !ok {
+		return policy, err
+	}
+	if err := checkKeys(s.data, s.context, nil, []string{"kv_cache_dtype", "indexer_kv_dtype", "block_size", "mamba_cache_mode", "recurrent_checkpoint_policy", "prefix_cache_retention_interval"}); err != nil {
+		return policy, err
+	}
 	if policy.KVCacheDType, err = s.stringOr("kv_cache_dtype", defaultKVCacheDType); err != nil {
 		return policy, err
 	}
-	if policy.Quantization, err = s.optionalString("quantization"); err != nil {
+	if policy.IndexerKVDType, err = s.optionalString("indexer_kv_dtype"); err != nil {
+		return policy, err
+	}
+	if policy.BlockSize, err = s.optionalPositiveInt("block_size"); err != nil {
+		return policy, err
+	}
+	if policy.MambaCacheMode, err = s.optionalString("mamba_cache_mode"); err != nil {
+		return policy, err
+	}
+	if policy.RecurrentCheckpointPolicy, err = s.optionalString("recurrent_checkpoint_policy"); err != nil {
+		return policy, err
+	}
+	if policy.PrefixCacheRetentionInterval, err = s.optionalNonNegativeInt("prefix_cache_retention_interval"); err != nil {
+		return policy, err
+	}
+	return policy, nil
+}
+
+func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
+	policy := KernelPolicy{Linear: defaultLinear, MoE: defaultMoE}
+	s, ok, err := subsection(data, "kernels", context)
+	if err != nil || !ok {
+		return policy, err
+	}
+	if err := checkKeys(s.data, s.context, nil, []string{"attention", "linear", "moe", "gdn_decode", "gdn_prefill", "kda_prefill", "mamba", "flashinfer_autotune"}); err != nil {
 		return policy, err
 	}
 	if policy.Attention, err = s.optionalString("attention"); err != nil {
@@ -638,22 +740,67 @@ func parseKernels(data map[string]any, context string) (KernelPolicy, error) {
 	if policy.GDNDecode, err = s.optionalString("gdn_decode"); err != nil {
 		return policy, err
 	}
-	if policy.BlockSize, err = s.optionalPositiveInt("block_size"); err != nil {
+	if policy.GDNPrefill, err = s.optionalString("gdn_prefill"); err != nil {
 		return policy, err
 	}
-	if policy.MambaCacheMode, err = s.optionalString("mamba_cache_mode"); err != nil {
+	if policy.KDAPrefill, err = s.optionalString("kda_prefill"); err != nil {
+		return policy, err
+	}
+	if policy.Mamba, err = s.optionalString("mamba"); err != nil {
 		return policy, err
 	}
 	if policy.FlashinferAutotune, err = s.optionalBool("flashinfer_autotune"); err != nil {
 		return policy, err
 	}
-	if policy.LoadFormat, err = s.stringOr("load_format", defaultLoadFormat); err != nil {
+	return policy, nil
+}
+
+func parseLoading(data map[string]any, context string) (LoadingPolicy, error) {
+	policy := LoadingPolicy{}
+	s, ok, err := subsection(data, "loading", context)
+	if err != nil || !ok {
+		return policy, err
+	}
+	if err := checkKeys(s.data, s.context, nil, []string{"load_format", "safetensors_load_strategy", "loader_extra_config"}); err != nil {
+		return policy, err
+	}
+	if policy.LoadFormat, err = s.stringOr("load_format", ""); err != nil {
+		return policy, err
+	}
+	if policy.SafetensorsLoadStrategy, err = s.optionalString("safetensors_load_strategy"); err != nil {
 		return policy, err
 	}
 	if policy.LoaderExtraConfig, err = s.optionalMapping("loader_extra_config"); err != nil {
 		return policy, err
 	}
 	return policy, nil
+}
+
+func parseEngram(data map[string]any, context string) (*EngramPolicy, error) {
+	s, ok, err := subsection(data, "engram", context)
+	if err != nil || !ok {
+		return nil, err
+	}
+	if err := checkKeys(s.data, s.context, nil, []string{"cpu_offload", "table_memory", "disk_resident_scales"}); err != nil {
+		return nil, err
+	}
+	var policy EngramPolicy
+	if policy.CPUOffload, err = s.boolOr("cpu_offload", true); err != nil {
+		return nil, err
+	}
+	if policy.TableMemory, err = s.stringOr("table_memory", "device"); err != nil {
+		return nil, err
+	}
+	if !contains([]string{"device", "ram", "disk"}, policy.TableMemory) {
+		return nil, fmt.Errorf("%s.table_memory must be device, ram, or disk", s.context)
+	}
+	if policy.DiskResidentScales, err = s.boolOr("disk_resident_scales", false); err != nil {
+		return nil, err
+	}
+	if policy.DiskResidentScales && policy.TableMemory != "disk" {
+		return nil, fmt.Errorf("%s.disk_resident_scales requires table_memory: disk", s.context)
+	}
+	return &policy, nil
 }
 
 func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, error) {
@@ -750,7 +897,7 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 	}
 	if ok {
 		if err := checkKeys(dspark.data, dspark.context, []string{"tokens", "model"}, []string{
-			"attention", "draft_sample_method", "rejection_sample_method", "adaptive_verification",
+			"attention", "draft_sample_method", "rejection_sample_method", "adaptive_verification", "adaptive_verification_cost_scale",
 		}); err != nil {
 			return policy, err
 		}
@@ -780,6 +927,12 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 		}
 		if settings.AdaptiveVerification, err = dspark.boolOr("adaptive_verification", false); err != nil {
 			return policy, err
+		}
+		if settings.AdaptiveVerificationCostScale, err = dspark.optionalNonNegativeFloat("adaptive_verification_cost_scale"); err != nil {
+			return policy, err
+		}
+		if scale := settings.AdaptiveVerificationCostScale; scale != nil && (*scale <= 0 || math.IsNaN(*scale) || math.IsInf(*scale, 0)) {
+			return policy, fmt.Errorf("%s.adaptive_verification_cost_scale must be finite and positive", dspark.context)
 		}
 		policy.DSpark = &settings
 	}
@@ -887,6 +1040,22 @@ func decodeProfile(name string, document map[string]any, context string) (ModelP
 	if err != nil {
 		return ModelProfile{}, err
 	}
+	precision, err := parsePrecision(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	cache, err := parseCache(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	loading, err := parseLoading(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
+	engram, err := parseEngram(document, context)
+	if err != nil {
+		return ModelProfile{}, err
+	}
 	kernels, err := parseKernels(document, context)
 	if err != nil {
 		return ModelProfile{}, err
@@ -908,13 +1077,9 @@ func decodeProfile(name string, document map[string]any, context string) (ModelP
 		return ModelProfile{}, err
 	}
 	return ModelProfile{
-		Name: name, Description: description, Serving: serving, Kernels: kernels,
+		Name: name, Description: description, Serving: serving, Precision: precision, Cache: cache, Kernels: kernels, Loading: loading, Engram: engram,
 		Speculators: speculators, Base: base, Overrides: overrides, Requires: requires,
 	}, nil
-}
-
-func loadFamilies(familiesData []byte) (map[string]map[string]any, error) {
-	return LoadFamilies(familiesData, "embedded model families")
 }
 
 // ManifestKind reports whether a catalog entry describes a serving model or
@@ -967,7 +1132,7 @@ func LoadModelEntry(
 	familiesData, manifestData []byte,
 	name, catalogCommit, label, trustedOwner string,
 ) (ModelProfile, error) {
-	families, err := loadFamilies(familiesData)
+	defaults, families, err := loadModelBases(familiesData, "embedded model bases")
 	if err != nil {
 		return ModelProfile{}, err
 	}
@@ -1006,7 +1171,7 @@ func LoadModelEntry(
 	for _, key := range []string{"schema_version", "kind", "family", "model", "revision"} {
 		delete(overlay, key)
 	}
-	profile, err := decodeProfile(name, deepMerge(resolved, overlay), label)
+	profile, err := decodeProfile(name, deepMerge(deepMerge(defaults, resolved), overlay), label)
 	if err != nil {
 		return ModelProfile{}, err
 	}
@@ -1020,6 +1185,10 @@ func LoadModelEntry(
 	profile.Revision = revision
 	profile.ManifestCommit = catalogCommit
 	profile.Family = familyName
+	servingOverrides, _ := deepMerge(resolved, overlay)["serving"].(map[string]any)
+	_, explicitShare := servingOverrides["prefill_compute_share"]
+	_, explicitHalfLife := servingOverrides["prefill_compute_half_life"]
+	profile.prefillComputeSharingFromDefaults = !explicitShare && !explicitHalfLife
 	return profile, nil
 }
 

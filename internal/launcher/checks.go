@@ -40,6 +40,31 @@ args = parser.parse_args(json.loads(sys.argv[1]))
 validate_parsed_serve_args(args)
 `
 
+const validateVLLMEngineConfig = `
+from pydantic import ValidationError
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.usage.usage_lib import UsageContext
+
+try:
+    if args.model_tag is not None:
+        args.model = args.model_tag
+    engine_args = AsyncEngineArgs.from_cli_args(args)
+    api_process_count = args.api_server_count
+    if api_process_count is None:
+        api_process_count = args.data_parallel_size
+    engine_args._api_process_count = api_process_count
+    if api_process_count > 1:
+        engine_args._api_process_rank = -1
+    engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
+except ValidationError as error:
+    messages = [item["msg"] for item in error.errors(include_input=False, include_url=False)]
+    print("; ".join(messages), file=sys.stderr)
+    sys.exit(1)
+except Exception as error:
+    print(f"{type(error).__name__}: {error}", file=sys.stderr)
+    sys.exit(1)
+`
+
 const sparkNodeProbe = `
 import json
 import os
@@ -237,20 +262,30 @@ func serveArguments(argv []string) ([]string, bool) {
 }
 
 func vllmArgvCheck(ctx context.Context, spec LaunchSpec) CheckResult {
+	name, script := "vLLM argv", parseVLLMArgv
+	timeout := 30 * time.Second
+	if spec.Topology.Local != nil {
+		name = "vLLM engine config"
+		script += validateVLLMEngineConfig
+		timeout = 60 * time.Second
+	}
 	arguments, ok := serveArguments(spec.VLLMArgv)
 	if !ok {
-		return CheckResult{"vLLM argv", "FAIL", "serve subcommand is absent"}
+		return CheckResult{name, "FAIL", "serve subcommand is absent"}
 	}
 	encoded, _ := json.Marshal(arguments)
-	argv := []string{spec.Topology.Python(), "-c", parseVLLMArgv, string(encoded)}
-	output, status, err := runCommand(ctx, 30*time.Second, spec.Topology.RepoRoot(), environmentForSpec(spec), argv)
+	argv := []string{spec.Topology.Python(), "-c", script, string(encoded)}
+	output, status, err := runCommand(ctx, timeout, spec.Topology.RepoRoot(), environmentForSpec(spec), argv)
 	if err != nil {
-		return CheckResult{"vLLM argv", "FAIL", err.Error()}
+		return CheckResult{name, "FAIL", err.Error()}
 	}
 	if status != 0 {
-		return CheckResult{"vLLM argv", "FAIL", lastOutputLine(output, fmt.Sprintf("exit status %d", status))}
+		return CheckResult{name, "FAIL", lastOutputLine(output, fmt.Sprintf("exit status %d", status))}
 	}
-	return CheckResult{"vLLM argv", "PASS", fmt.Sprintf("%d arguments accepted by the installed serve parser", len(arguments))}
+	if spec.Topology.Local != nil {
+		return CheckResult{name, "PASS", fmt.Sprintf("%d serve arguments and engine configuration accepted by the configured runtime", len(arguments))}
+	}
+	return CheckResult{name, "PASS", fmt.Sprintf("%d arguments accepted by the installed serve parser", len(arguments))}
 }
 
 func gpuCheck(ctx context.Context, spec LaunchSpec) CheckResult {

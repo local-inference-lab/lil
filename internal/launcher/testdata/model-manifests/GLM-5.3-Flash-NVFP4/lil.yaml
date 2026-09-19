@@ -8,10 +8,12 @@ serving:
   multimodal:
     encoder_tp_mode: data
     processor_cache_gb: 0
-kernels:
+precision:
   quantization: modelopt_mixed
+cache:
   block_size: 256
   mamba_cache_mode: align
+kernels:
   flashinfer_autotune: false
 speculators:
   default: mtp
@@ -33,8 +35,3 @@ overrides:
     capacity:
       max_num_batched_tokens: 2048
       kv_cache_memory_bytes: 2G
-    environment:
-      INSTANTTENSOR_BUFFER_SIZE: "67108864"
-      INSTANTTENSOR_CHUNK_SIZE: "8388608"
-      INSTANTTENSOR_CONCURRENCY: "1"
-      INSTANTTENSOR_IO_DEPTH: "3"
