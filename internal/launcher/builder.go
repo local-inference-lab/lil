@@ -439,6 +439,21 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 			"method": "dflash", "model": policy.Model,
 			"num_speculative_tokens": tokens, "kv_cache_dtype": "auto",
 		}
+		if policy.Attention != nil {
+			config["attention_backend"] = *policy.Attention
+		}
+		if policy.Subfolder != "" {
+			if policy.Model != profile.Model {
+				return result, fmt.Errorf("DFlash subfolder must belong to the target model repository")
+			}
+			config["model_subfolder"] = policy.Subfolder
+		}
+		if policy.Model == profile.Model {
+			config["model"] = modelSource
+			if profile.Revision != "" {
+				config["revision"] = profile.Revision
+			}
+		}
 		encoded, err := compactJSON(config)
 		result.Config = &encoded
 		return result, err
@@ -544,7 +559,7 @@ func speculativeConfig(profile ModelProfile, facts *CheckpointFacts, modelSource
 
 // cudagraphCaptureSizes covers every uniform verification batch through
 // maxNumSeqs plus a mixed-batch ladder. The ladder extends to twice the
-// uniform maximum except for DSpark, whose verifier never exceeds one
+// uniform maximum except for block drafts, whose verifier never exceeds one
 // sampled token plus its drafts per request.
 func cudagraphCaptureSizes(maxNumSeqs, maxNumBatchedTokens, queryLen, mixedMultiplier int) []int {
 	maxMixedTokens := min(maxNumSeqs*queryLen*mixedMultiplier, maxNumBatchedTokens, 1024)
@@ -588,7 +603,7 @@ func compilationConfig(settings LaunchSettings, maxNumSeqs, maxNumBatchedTokens 
 	switch spec.Effective() {
 	case "mtp":
 		queryLen = spec.Tokens + 1
-	case "dspark":
+	case "dspark", "dflash":
 		queryLen, mixedMultiplier = spec.Tokens+1, 1
 	}
 	config["cudagraph_capture_sizes"] = cudagraphCaptureSizes(
@@ -711,6 +726,8 @@ func resolveCacheBlockSize(profile ModelProfile, facts *CheckpointFacts, spec sp
 	switch spec.Effective() {
 	case "mtp":
 		draftAttention = profile.Speculators.MTP.Attention
+	case "dflash":
+		draftAttention = profile.Speculators.DFlash.Attention
 	case "dspark":
 		draftAttention = profile.Speculators.DSpark.Attention
 	}

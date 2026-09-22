@@ -181,16 +181,18 @@ every safetensors shard at that commit. Bytes already cached for an immutable
 commit are reused. Network resolution errors fail the command rather than
 silently using stale model policy.
 
-For DFlash, the draft's catalog entry must name the draft repository and list
-the serving model as compatible.
+For a DFlash draft in a separate repository, its catalog entry must name that
+repository and list the serving model as compatible. A draft inside the target
+repository uses `speculators.dflash.subfolder` and needs no separate entry.
 
 An unpinned entry never emits `--revision`, and `lil run` invokes
 `hf download OWNER/REPOSITORY` without one: the HF CLI checks repository head,
 downloads missing or changed files into the standard cache, and streams its
 progress to the terminal. A pinned entry emits `--revision` and downloads that
-commit. DFlash launches update both the serving model and the draft
-repository. An explicit `--model-path` skips the serving-model download but
-still updates any Hub-backed draft.
+commit. DFlash launches update both repositories when the draft is separate.
+A draft subfolder shares the target revision and download. An explicit
+`--model-path` also selects that local draft subfolder and skips their download;
+a draft in a separate repository is still updated.
 
 For Spark/RDMA, `lil` updates each rank's cache through SSH. It prefers the `hf`
 executable beside the topology's runtime Python, then checks `PATH`, with
@@ -414,6 +416,13 @@ The sections:
   draft always ships inside the target checkpoint. `dspark.adaptive_verification`
   sets its default verification policy; `--adaptive-verification=true` or
   `--adaptive-verification=false` overrides it for one launch.
+  DFlash uses `dflash.model` and `dflash.tokens`. For a draft shipped in the
+  target repository, set `dflash.model` to the target repository ID and
+  `dflash.subfolder` to its relative directory, such as `dflash`. This requires
+  vLLM support for `speculative_config.model_subfolder`. Optional
+  `dflash.attention` selects the draft attention backend independently of the
+  target. B12X noncausal sliding attention requires BF16 KV and vLLM support
+  for paged draft caches.
 - `capacity`, `compilation`, and `environment` are the base launch layer.
   Capacity defaults are `max_model_len: auto`, eight sequences, and 4096
   batched tokens; `capacity.gpu_memory_utilization` replaces the topology's
@@ -428,8 +437,8 @@ The sections:
 - `requires.arch` lists the architectures a checkpoint may run on. A launch on
   any other topology fails, and `lil list` marks the topology.
 
-Draft checkpoints are entries of `kind: draft`. They are not listed as
-serving models; a serving entry's `speculators.dflash.model` must match a
+Draft checkpoints in separate repositories are entries of `kind: draft`. They
+are not listed as serving models; `speculators.dflash.model` must match a
 draft entry whose compatibility list contains the serving model's repository:
 
 ```yaml

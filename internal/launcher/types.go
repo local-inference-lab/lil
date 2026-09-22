@@ -332,8 +332,10 @@ type MTPPolicy struct {
 }
 
 type DFlashPolicy struct {
-	Tokens int
-	Model  string
+	Attention *string
+	Tokens    int
+	Model     string
+	Subfolder string
 }
 
 // DSparkPolicy describes a DeepSeek DSpark draft, which ships inside the

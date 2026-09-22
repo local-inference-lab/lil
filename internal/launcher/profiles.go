@@ -872,7 +872,7 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 		return policy, err
 	}
 	if ok {
-		if err := checkKeys(dflash.data, dflash.context, []string{"tokens", "model"}, nil); err != nil {
+		if err := checkKeys(dflash.data, dflash.context, []string{"tokens", "model"}, []string{"subfolder", "attention"}); err != nil {
 			return policy, err
 		}
 		tokens, err := dflash.optionalNonNegativeInt("tokens")
@@ -889,7 +889,22 @@ func parseSpeculators(data map[string]any, context string) (SpeculatorPolicy, er
 		if !hfModelID.MatchString(model) {
 			return policy, fmt.Errorf("%s.model must be a Hugging Face model ID", dflash.context)
 		}
-		policy.DFlash = &DFlashPolicy{Tokens: *tokens, Model: model}
+		subfolder, err := dflash.stringOr("subfolder", "")
+		if err != nil {
+			return policy, err
+		}
+		if subfolder != "" {
+			for _, part := range strings.Split(subfolder, "/") {
+				if part == "." || part == ".." || !hfRepositoryName.MatchString(part) {
+					return policy, fmt.Errorf("%s.subfolder must be a relative checkpoint directory", dflash.context)
+				}
+			}
+		}
+		attention, err := dflash.optionalString("attention")
+		if err != nil {
+			return policy, err
+		}
+		policy.DFlash = &DFlashPolicy{Tokens: *tokens, Model: model, Subfolder: subfolder, Attention: attention}
 	}
 	dspark, ok, err := subsection(s.data, "dspark", s.context)
 	if err != nil {

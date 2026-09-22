@@ -272,4 +272,9 @@ func TestDFlashLaunchValidatesTheDraftEntry(t *testing.T) {
 	if err := loaded.draftFor(profile); err == nil || !strings.Contains(err.Error(), "no catalog draft entry") {
 		t.Fatalf("missing draft: %v", err)
 	}
+	profile.Speculators.DFlash.Model = profile.Model
+	profile.Speculators.DFlash.Subfolder = "dflash"
+	if err := loaded.draftFor(profile); err != nil {
+		t.Fatalf("target-resident draft: %v", err)
+	}
 }

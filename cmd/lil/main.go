@@ -401,6 +401,9 @@ func (c catalog) draftFor(profile launcher.ModelProfile) error {
 	if profile.Speculators.DFlash == nil {
 		return fmt.Errorf("model %q does not define a DFlash draft repository", profile.Name)
 	}
+	if profile.Speculators.DFlash.Subfolder != "" && profile.Speculators.DFlash.Model == profile.Model {
+		return nil
+	}
 	for _, draft := range c.drafts {
 		if draft.Model != profile.Speculators.DFlash.Model {
 			continue

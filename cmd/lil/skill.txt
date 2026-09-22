@@ -82,7 +82,7 @@ Choose the relevant sections; do not copy every setting indiscriminately:
 - cache: kv_cache_dtype (default fp8), indexer_kv_dtype, block_size,
   mamba_cache_mode, recurrent_checkpoint_policy, and
   prefix_cache_retention_interval. Use only settings relevant to the model.
-  B12X paged attention on the target or an active MTP/DSpark draft automatically
+  B12X paged attention on the target or an active MTP/DSpark/DFlash draft automatically
   uses block_size: 128 when the manifest omits it or specifies an incompatible
   size. Explicit 64 and 128 are preserved. Sparse/MLA block sizing is unchanged.
 - kernels: attention, linear, moe, gdn_prefill, gdn_decode, kda_prefill, mamba,
@@ -144,7 +144,7 @@ DSpark uses speculators.default: dspark and a dspark mapping with tokens and
 model: target. DSpark weights always live inside the target checkpoint. Its
 adaptive_verification field sets the default verification policy.
 
-DFlash uses a separate draft entry. In the serving manifest, set
+DFlash can use a separate draft entry. In the serving manifest, set
 speculators.dflash.model to the draft's full repository ID and set
 speculators.dflash.tokens; choose default: dflash to enable it by default.
 The corresponding draft entry has this shape (replace the placeholder IDs and
@@ -163,6 +163,14 @@ Put this in catalog/My-Draft/lil.yaml. compatible_models lists the serving
 weight repository IDs, not catalog launch names. Draft entries are hidden from
 lil list and cannot be launched as serving models. Local draft entries do not
 need the config/index sidecars required for serving entries.
+
+For a draft stored inside the target repository, set dflash.model to the target
+repository ID and dflash.subfolder to its relative directory (for example,
+dflash). The target revision and any --model-path override also apply to that
+draft. No separate draft catalog entry is needed. This requires vLLM support
+for speculative_config.model_subfolder. Optional dflash.attention selects the
+draft attention backend independently of the target. B12X noncausal sliding
+attention requires BF16 KV and a vLLM adapter for paged draft caches.
 
 5. Validate the definition before publishing.
 

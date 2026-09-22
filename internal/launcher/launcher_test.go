@@ -1101,6 +1101,59 @@ func TestHubLaunchDownloadsTargetAndDraftRepositories(t *testing.T) {
 	}
 }
 
+func TestDFlashSubfolderUsesTargetRevisionAndVerificationShapes(t *testing.T) {
+	config := loadTestConfig(t)
+	profile := config.profiles[glmFlashProfile]
+	profile.Revision = testCommit
+	profile.Speculators.DFlash = &DFlashPolicy{Model: profile.Model, Subfolder: "dflash", Tokens: 7, Attention: stringPointer("B12X")}
+	options := defaultOptions(2)
+	options.Speculator = stringPointerTest("dflash")
+	options.MaxNumSeqs = intPointer(4)
+	spec, err := BuildLaunchSpec(profile, config.local, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := speculativeConfigValue(t, spec)
+	if draft["model"] != profile.Model || draft["model_subfolder"] != "dflash" || draft["revision"] != testCommit || draft["attention_backend"] != "B12X" {
+		t.Fatalf("draft configuration: %+v", draft)
+	}
+	if !reflect.DeepEqual(spec.Downloads, []RepositoryDownload{{Repository: profile.Model, Revision: testCommit}}) {
+		t.Fatalf("target-resident draft downloads: %+v", spec.Downloads)
+	}
+	var compilation map[string]any
+	if err := json.Unmarshal([]byte(optionValue(t, spec.VLLMArgv, "--compilation-config")), &compilation); err != nil {
+		t.Fatal(err)
+	}
+	want := []any{float64(1), float64(2), float64(4), float64(8), float64(16), float64(24), float64(32)}
+	if !reflect.DeepEqual(compilation["cudagraph_capture_sizes"], want) {
+		t.Fatalf("verification capture sizes: %+v", compilation)
+	}
+	local, err := speculativeConfig(profile, nil, "/local/checkpoint", 2, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(*local.Config), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if draft["model"] != "/local/checkpoint" || draft["model_subfolder"] != "dflash" {
+		t.Fatalf("local target-resident draft: %+v", draft)
+	}
+}
+
+func TestDFlashSubfolderRequiresRelativeCheckpointDirectory(t *testing.T) {
+	for _, subfolder := range []string{"dflash", "drafts/dflash", "/dflash", "../dflash", "dflash/../other", "."} {
+		_, err := parseSpeculators(map[string]any{"speculators": map[string]any{
+			"default": "dflash", "dflash": map[string]any{
+				"model": "owner/model", "tokens": 7, "subfolder": subfolder,
+			},
+		}}, "test")
+		valid := subfolder == "dflash" || subfolder == "drafts/dflash"
+		if (err == nil) != valid {
+			t.Errorf("subfolder %q: %v", subfolder, err)
+		}
+	}
+}
+
 func TestLocalHuggingFaceDownloadUsesConfiguredEnvironmentOnline(t *testing.T) {
 	directory := t.TempDir()
 	bin := filepath.Join(directory, "bin")
