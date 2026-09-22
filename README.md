@@ -237,6 +237,20 @@ paths: treat imported files as immutable. There is no copy fallback.
 Verification progress and counts go to stderr; stdout contains the snapshot
 path. A dry run performs the same content checks without writing cache entries.
 
+## Agent instructions
+
+`lil skill` prints a plaintext guide for agents adding model definitions,
+including the catalog layout, manifest schema, family inheritance, speculation,
+and validation and publication workflows:
+
+```bash
+lil skill
+lil skill > /tmp/lil-model-definitions.txt
+```
+
+The guide is embedded in the executable and works without network access,
+topology configuration, or a repository checkout.
+
 ## Edit model manifests
 
 ```bash

@@ -1,0 +1,214 @@
+Add lil model definitions
+
+Use this guide to add a model's launch policy to lil. Definitions use
+schema_version: 1. The lil executable embeds this guide; printing it needs no
+network, topology, checkpoint, or repository checkout.
+
+1. Identify the checkpoint and launch policy.
+
+Inspect the actual weight repository, its config.json, quantization metadata,
+and a working vLLM invocation for the intended hardware. Record the repository
+ID and commit used for validation. Establish the serving name, tokenizer and
+parsers, precision, cache dtype, kernel backends, and supported speculation.
+Do not infer those settings from a similar model's name alone.
+
+Checkpoint facts belong to the weights: lil reads architectures, attention
+heads, stored weight size, and MTP expert quantization from checkpoint metadata.
+The manifest records launch policy. GPU inventory, paths, device pools, SSH,
+RDMA, and host tuning belong to topology YAML produced by lil discover.
+
+2. Create a catalog entry.
+
+The published catalog is the Hugging Face model repository
+local-inference-lab/lil-catalog. Each entry is NAME/lil.yaml. NAME is the launch
+name used by lil render/check/run; model is the owner/name repository holding
+the weights, and serving.served_model_name is the API-facing identity. These
+three names need not be equal. Use letters, digits, underscores, dots, and
+hyphens in NAME, beginning with a letter or digit.
+
+Start with a separate local catalog directory:
+
+  catalog/
+    My-Model/
+      lil.yaml
+      config.json
+      model.safetensors.index.json
+
+Copy config.json and model.safetensors.index.json from the exact checkpoint
+being defined. The index must supply a positive metadata.total_size for
+metadata-only validation; do not invent model facts or weight sizes. These
+metadata files let lil list and lil render work without downloading weights.
+They are local validation inputs; the published catalog entry needs lil.yaml.
+
+Minimal model manifest, with owner/model and My-Model as placeholders:
+
+  schema_version: 1
+  kind: model
+  model: owner/model
+  description: Describe the architecture and checkpoint format.
+  serving:
+    served_model_name: My-Model
+
+The resolved model must have a non-empty description and served_model_name.
+Optional revision pins the weight repository to a 40-character lowercase
+commit SHA, not a branch or tag. If serving.trust_remote_code is true and the
+weight repository is outside local-inference-lab, revision is required. This
+also applies when trust_remote_code is inherited from a family.
+
+3. Set the policy supported by the checkpoint and vLLM installation.
+
+The optional family key selects shared defaults embedded from
+configs/models/_bases.yaml in the lil source repository. The families are glm
+and deepseek-v4. Inspect their policies before reusing them; family is optional.
+Adding a family requires changing that file and rebuilding lil. Adding an
+entry using supported fields and existing families does not require Go changes.
+
+Embedded defaults apply first, then the family (including its parents), then
+the manifest. Mappings merge recursively; scalars, lists, and explicit null
+replace inherited values. An empty mapping does not clear inherited keys.
+Null clears inheritance: optional fields then emit no flag, while defaulted
+fields use their launcher default. Unknown schema keys and invalid types fail.
+
+Choose the relevant sections; do not copy every setting indiscriminately:
+
+- serving: served_model_name, trust_remote_code, tokenizer_mode,
+  reasoning_parser, tool_call_parser, auto_tool_choice, generation_config,
+  hf_overrides, chat_template_kwargs, scheduler policy, and multimodal limits.
+  Parser names must be supported by the configured vLLM. auto_tool_choice
+  defaults to true when a tool_call_parser is set. Embedded defaults enable
+  async scheduling, prefix caching, and chunked prefill.
+- precision: dtype (default bfloat16) and optional quantization, such as
+  modelopt_mixed when supported by the checkpoint and vLLM.
+- cache: kv_cache_dtype (default fp8), indexer_kv_dtype, block_size,
+  mamba_cache_mode, recurrent_checkpoint_policy, and
+  prefix_cache_retention_interval. Use only settings relevant to the model.
+  B12X paged attention on the target or an active MTP/DSpark draft automatically
+  uses block_size: 128 when the manifest omits it or specifies an incompatible
+  size. Explicit 64 and 128 are preserved. Sparse/MLA block sizing is unchanged.
+- kernels: attention, linear, moe, gdn_prefill, gdn_decode, kda_prefill, mamba,
+  and flashinfer_autotune. Linear and MoE default to b12x. Backend names are
+  case-sensitive (for example attention: B12X versus moe: b12x); vLLM checks
+  backend support. Select B12X GDN prefill and decode consistently.
+- loading: load_format, safetensors_load_strategy, and loader_extra_config.
+  By default local PCIe launches use instanttensor; Spark or sm_121a uses b12x.
+- capacity: gpu_memory_utilization, kv_cache_memory_bytes, max_model_len,
+  max_num_seqs, and max_num_batched_tokens. Defaults are the topology's memory
+  utilization, automatic KV sizing, auto model length, 8 sequences, and 4096
+  batched tokens. Quote max_model_len and kv_cache_memory_bytes, including
+  numeric values; these fields are strings. CLI flags override these defaults.
+- compilation: vLLM compilation configuration. Embedded defaults use
+  FULL_AND_PIECEWISE CUDA graphs and custom_ops: [all]. lil computes
+  cudagraph_capture_sizes from resolved scheduler and speculation settings.
+- environment: model-specific NAME: "VALUE" entries. All values must be
+  strings. Host tuning belongs in the topology; lil derives runtime variables
+  such as device selection. One-off --env NAME=VALUE overrides tuning.
+- requires: arch is a list of supported topology CuTe DSL architectures, such
+  as [sm_120a]. It refers to GPU architectures, not config.json architectures.
+- engram: cpu_offload, table_memory (device, ram, or disk), and
+  disk_resident_scales, for checkpoints with the corresponding PLE support.
+
+Use ordered overrides for conditional capacity, compilation, or environment
+only. Each when needs at least one condition: kind (local or spark_rdma), arch,
+tp, or speculator (mtp, dflash, dspark, or none). All conditions must match;
+later matching entries win. A zero-token speculator matches none. For example,
+add this top-level section when TP=1 needs lower concurrency:
+
+  overrides:
+    - when:
+        kind: local
+        tp: 1
+      capacity:
+        max_num_seqs: 1
+        max_num_batched_tokens: 2048
+
+4. Configure speculation only when supported.
+
+Omission defaults to speculators.default: none. To enable MTP, define an mtp
+section and select it as the default. For a checkpoint with target-resident MTP
+weights, a policy fragment is:
+
+  speculators:
+    default: mtp
+    mtp:
+      tokens: 3
+      model: target
+
+mtp.moe_quantization is a fallback hint (nvfp4, mxfp4, mxfp8, fp8, or bf16) used
+only when checkpoint metadata cannot determine the expert format. Detected
+checkpoint quantization takes precedence; mtp.moe_backend explicitly overrides
+backend selection. Set model: target only when the draft weights must be loaded
+from the target checkpoint. Optional attention, draft_sample_method, and
+rejection_sample_method must be supported by the configured vLLM.
+
+DSpark uses speculators.default: dspark and a dspark mapping with tokens and
+model: target. DSpark weights always live inside the target checkpoint. Its
+adaptive_verification field sets the default verification policy.
+
+DFlash uses a separate draft entry. In the serving manifest, set
+speculators.dflash.model to the draft's full repository ID and set
+speculators.dflash.tokens; choose default: dflash to enable it by default.
+The corresponding draft entry has this shape (replace the placeholder IDs and
+quantization with the actual checkpoint's values):
+
+  schema_version: 1
+  kind: draft
+  model: owner/draft-model
+  description: DFlash draft compatible with owner/model.
+  method: dflash
+  quantization: mxfp8
+  compatible_models:
+    - owner/model
+
+Put this in catalog/My-Draft/lil.yaml. compatible_models lists the serving
+weight repository IDs, not catalog launch names. Draft entries are hidden from
+lil list and cannot be launched as serving models. Local draft entries do not
+need the config/index sidecars required for serving entries.
+
+5. Validate the definition before publishing.
+
+Replace ./catalog, My-Model, and /path/to/topology.yaml with actual paths and
+names. Use a discovered topology for the intended hardware:
+
+  lil list --models-config ./catalog
+  lil render My-Model --models-config ./catalog --config /path/to/topology.yaml
+  lil render My-Model --models-config ./catalog --config /path/to/topology.yaml --format json
+  lil check My-Model --models-config ./catalog --config /path/to/topology.yaml
+
+--models-config selects the local directory instead of the Hub catalog and
+local overrides. Every serving entry in that directory must have its metadata
+sidecars. List and render validate metadata and policy without running vLLM;
+check runs read-only preflight checks against the actual runtime and hardware.
+Render success alone does not establish runtime support.
+
+Inspect the resolved model and revision, API name, environment, TP, capacity,
+kernel selectors, speculative config, and CUDA graph configuration. Render the
+intended topologies and matching override cases; TP must divide the checkpoint's
+attention head count and fit the topology. Validate both the chosen speculator
+and --speculator none when speculation is configured. An optional --model-path
+must point to the actual checkpoint, not the metadata-only catalog directory.
+Use lil run only when a live launch is intended and authorized.
+
+For lil source changes, run make check. Schema and inheritance are implemented
+in internal/launcher/profiles.go; launch resolution is in
+internal/launcher/builder.go. README.md documents policy fields, and
+internal/launcher/testdata/model-manifests contains catalog reference fixtures.
+
+6. Publish or keep the definition local.
+
+To make NAME available through the default Hub catalog, add NAME/lil.yaml to
+local-inference-lab/lil-catalog through its commit/upload workflow. Include any
+DFlash draft entry referenced by the serving entry. After publishing, verify
+lil render NAME with the intended topology and without --models-config.
+
+For local development, keep using --models-config. The file
+${XDG_CONFIG_HOME:-~/.config}/lil/models/NAME/lil.yaml is a complete override of
+an existing published entry; it does not register an unpublished launch name.
+lil edit NAME edits that override or copies an existing catalog manifest.
+lil edit NAME --repository edits and uploads an existing upstream manifest;
+it is not a command for creating entries. Existing local overrides still shadow
+published updates. Neither lil import nor placing lil.yaml in a weight
+repository registers a catalog entry; lil import only populates the Hub cache.
+
+Report the manifest paths, weight repository and validation commit, commands
+run, and any failed or skipped runtime checks. Distinguish a rendered definition
+from a model qualified by a successful launch on the intended hardware.

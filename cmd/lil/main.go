@@ -806,6 +806,7 @@ Commands:
   list      List the catalog's launchable models and local topologies.
   discover  Discover and save a local or Spark/RDMA topology.
   edit      Edit a model manifest locally or in the Hugging Face catalog.
+  skill     Print agent instructions for adding model definitions.
   import    Import local model files into the Hugging Face cache using hardlinks.
   render    Render the resolved environment and command without executing it.
   check     Run read-only launch preflight checks.
@@ -845,6 +846,8 @@ func execute(ctx context.Context, args []string) (int, error) {
 		return commandErrorStatus(discoverCommand(ctx, args[1:]))
 	case "edit":
 		return commandErrorStatus(editCommand(ctx, args[1:]))
+	case "skill":
+		return commandErrorStatus(skillCommand(args[1:]))
 	case "import":
 		return commandErrorStatus(importCommand(ctx, args[1:]))
 	case "render":
