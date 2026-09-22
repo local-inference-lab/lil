@@ -372,6 +372,10 @@ The sections:
   when supported and aligned retention otherwise. The retention interval is
   a non-negative integer; `0` retains only semantic checkpoints. Omission
   leaves the vLLM default in effect. `block_size` must be a positive integer.
+  When the target or an active MTP/DSpark draft selects B12X paged attention,
+  lil replaces an omitted or incompatible block size with `128`, preserving
+  supported values of `64` and `128`. Sparse/MLA checkpoints retain their
+  model-specific block sizing.
 - `kernels` selects `attention`, `linear`, `moe`, `gdn_prefill`, `gdn_decode`,
   `kda_prefill`, and `mamba` backends and controls `flashinfer_autotune`.
   Linear and MoE backends default to `b12x`. In the configured vLLM fork,

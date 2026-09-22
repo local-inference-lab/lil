@@ -704,6 +704,31 @@ type argvInputs struct {
 	kvCacheDType    string
 }
 
+func resolveCacheBlockSize(profile ModelProfile, facts *CheckpointFacts, spec speculation) *int {
+	blockSize := profile.Cache.BlockSize
+	attention := profile.Kernels.Attention
+	var draftAttention *string
+	switch spec.Effective() {
+	case "mtp":
+		draftAttention = profile.Speculators.MTP.Attention
+	case "dspark":
+		draftAttention = profile.Speculators.DSpark.Attention
+	}
+	if (attention == nil || *attention != "B12X") && (draftAttention == nil || *draftAttention != "B12X") {
+		return blockSize
+	}
+	// B12X sparse/MLA backends use model-specific page geometry.
+	config := modelConfig(facts.Config)
+	if config["kv_lora_rank"] != nil || config["compress_ratios"] != nil {
+		return blockSize
+	}
+	if blockSize != nil && (*blockSize == 64 || *blockSize == 128) {
+		return blockSize
+	}
+	preferred := 128
+	return &preferred
+}
+
 func buildVLLMArgv(profile ModelProfile, topology Topology, options LaunchOptions, in argvInputs) ([]string, error) {
 	serving, kernels := profile.Serving, profile.Kernels
 	precision, cache, loading := profile.Precision, profile.Cache, profile.Loading
@@ -1152,6 +1177,7 @@ func BuildLaunchSpec(profile ModelProfile, topology Topology, options LaunchOpti
 	if profile.Loading.LoadFormat == "" {
 		profile.Loading.LoadFormat = topology.DefaultLoadFormat()
 	}
+	profile.Cache.BlockSize = resolveCacheBlockSize(profile, facts, spec)
 	needsNVRTC := spec.Decision != nil && spec.Decision.Backend == "humming"
 	environment, unsetEnvironment, err := runtimeEnvironment(topology, settings, options, needsNVRTC, profile.Loading.LoadFormat)
 	if err != nil {
