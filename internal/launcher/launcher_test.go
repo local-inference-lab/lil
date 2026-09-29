@@ -599,6 +599,13 @@ func TestLoaderDefaultsFollowPlatformAndPreserveModelOverrides(t *testing.T) {
 				if got := spec.RuntimeEnvironment["VLLM_PLUGINS"]; got != test.plugins {
 					t.Errorf("%s plugins: got %q, want %q", name, got, test.plugins)
 				}
+				wantAllocator := "expandable_segments:True"
+				if test.loader == "b12x" {
+					wantAllocator = ""
+				}
+				if got := spec.RuntimeEnvironment["PYTORCH_CUDA_ALLOC_CONF"]; got != wantAllocator {
+					t.Errorf("%s allocator: got %q, want %q", name, got, wantAllocator)
+				}
 				if slices.Contains(spec.VLLMArgv, "--model-loader-extra-config") {
 					t.Errorf("%s configures loader tuning: %v", name, spec.VLLMArgv)
 				}
@@ -609,6 +616,30 @@ func TestLoaderDefaultsFollowPlatformAndPreserveModelOverrides(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestB12xLoaderPreservesExplicitAllocatorOverrides(t *testing.T) {
+	config := loadTestConfig(t)
+	profile := config.profiles[qwenProfile]
+	profile.Loading.LoadFormat = "b12x"
+	profile.Base.Environment["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+	options := defaultOptions(2)
+	for _, override := range []string{"", "expandable_segments:False"} {
+		if override != "" {
+			options.EnvironmentOverrides = []EnvironmentOverride{{"PYTORCH_CUDA_ALLOC_CONF", override}}
+		}
+		spec, err := BuildLaunchSpec(profile, config.local, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := profile.Base.Environment["PYTORCH_CUDA_ALLOC_CONF"]
+		if override != "" {
+			want = override
+		}
+		if got := spec.RuntimeEnvironment["PYTORCH_CUDA_ALLOC_CONF"]; got != want {
+			t.Errorf("allocator override: got %q, want %q", got, want)
+		}
 	}
 }
 

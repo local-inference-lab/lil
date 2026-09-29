@@ -117,6 +117,10 @@ func runtimeEnvironment(topology Topology, settings LaunchSettings, options Laun
 	environment["CUTE_DSL_ARCH"] = topology.CuteDSLArch()
 	environment["B12X_POLICY_MODE"] = options.B12XPolicyMode
 	if loadFormat == "b12x" {
+		// CUDA IPC cannot export the expandable allocations used by this default.
+		if environment["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True" {
+			delete(environment, "PYTORCH_CUDA_ALLOC_CONF")
+		}
 		plugins := strings.Split(environment["VLLM_PLUGINS"], ",")
 		if !contains(plugins, "b12x_loader") {
 			environment["VLLM_PLUGINS"] = strings.Trim(environment["VLLM_PLUGINS"]+",b12x_loader", ",")
