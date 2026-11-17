@@ -1,9 +1,9 @@
 module github.com/local-inference-lab/lil
 
-go 1.26
+go 1.26.7
 
 require (
-	charm.land/lipgloss/v2 v2.0.6
+	charm.land/lipgloss/v2 v2.1.0
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/spf13/pflag v1.0.10
 	gopkg.in/yaml.v3 v3.0.1
